@@ -1,0 +1,14 @@
+# Loader patch layer for dsh-chat-sessions.
+# Installed by `plugin_manager` `install_bundle`; never hand-written into a profile.
+- insert:
+    - id: chat-sessions
+      name: 'dsh-chat-sessions'
+      config:
+        # Standalone-chat root. Empty = `$DSH_HOME/chats`, i.e. ~/.dsh/chats here.
+        # Real session directories live in `<root>/.sessions/session-<uuid>/`; the
+        # user-visible titles are relative symlinks directly under `<root>`.
+        root: ''
+        # S5: hide the synthetic "no workspace" bucket header in the sidebar so
+        # workspace-free sessions read as top-level siblings of the workspace
+        # rows. Set to false to keep the shipped grouping untouched.
+        flattenUngrouped: true

@@ -1,0 +1,13 @@
+node_modules/
+.DS_Store
+*.tgz
+*.tar.gz
+coverage/
+playwright-report/
+test-results/
+.env
+.env.*
+!.env.example
+.credentials.yaml
+*.log
+evidence/
