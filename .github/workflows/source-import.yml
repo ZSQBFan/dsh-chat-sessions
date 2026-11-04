@@ -1,0 +1,54 @@
+name: Import reviewed v0.1.0 source
+on:
+  push:
+    paths:
+      - '.github/workflows/source-import.yml'
+permissions:
+  contents: write
+jobs:
+  import:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+      - name: Verify and import approved source snapshot
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import urllib.request, hashlib, base64, gzip, json, pathlib, subprocess
+          url = 'https://openviking.zsqbfan.com/api/v1/content/download?token=3zmT7WScxJ'
+          encoded = urllib.request.urlopen(url, timeout=90).read(2000000)
+          assert hashlib.sha256(encoded).hexdigest() == '6e6a701fe2e74ffc8775cf5896a698fc41aa0a7a587e23d982063d95143b12a4'
+          raw = gzip.decompress(base64.b64decode(encoded))
+          assert hashlib.sha256(raw).hexdigest() == '999aa25b7eb029996d3109936cb3449404727aeb7ba9a118b024210a20cc0105'
+          data = json.loads(raw)
+          assert data['source_commit'] == 'e3a1d2b8bf66bff97fd0d8ef47a1548214665c13'
+          expected = {'.gitignore','CHANGELOG.md','LICENSE','README.en.md','README.md','check-activity-browser.mjs','check-archive-native.mjs','check-archive.mjs','check-create.mjs','check-fold-browser.mjs','check-header.mjs','check-membership-browser.mjs','check.mjs','client.js','cordis.patch.yml','gc.js','icon.svg','index.js','links.js','locale/en.json','locale/zh.json','package-lock.json','package.json','test-support/archive-fixture.mjs'}
+          assert len(data['files']) == 24
+          assert {item['path'] for item in data['files']} == expected
+          root = pathlib.Path.cwd().resolve()
+          for item in data['files']:
+              target = root / item['path']
+              assert target.resolve().is_relative_to(root)
+              body = item['content'].encode('utf-8')
+              assert hashlib.sha256(body).hexdigest() == item['sha256']
+              target.parent.mkdir(parents=True, exist_ok=True)
+              target.write_bytes(body)
+          subprocess.run(['git','add','--',*sorted(expected)],check=True)
+          print('Verified and staged 24 exact files from reviewed local commit.')
+          PY
+      - name: Commit imported public source
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if git diff --cached --quiet; then
+            echo 'Reviewed files already match.'
+          else
+            git commit -m 'feat: import reviewed dsh-chat-sessions v0.1.0 source'
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
