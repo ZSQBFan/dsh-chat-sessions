@@ -13,7 +13,7 @@ A small personal [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harn
 
 ## Installation and use
 
-**v0.1.0 is being prepared and has not been released.** For now, you need the complete local plugin directory. Enter its absolute path under **Plugins → Add plugin** in DSH, install it, and enable it. Follow the host's restart instructions if shown. Published installation sources will be added here when available.
+**v0.1.0 is released**: [GitHub Release](https://github.com/ZSQBFan/dsh-chat-sessions/releases/tag/v0.1.0). Download the package from the Release to install it; the `main` branch is for continued development and the release tag remains fixed. Follow the host's restart instructions if shown.
 
 Choose the standalone chat entry in the home page workspace picker, or use the new-chat button beside the standalone sidebar heading. Archive and restore through the native session menu and archived list. Archiving removes a pin; pin the chat again after restoring if needed.
 
