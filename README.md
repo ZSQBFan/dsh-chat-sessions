@@ -11,6 +11,10 @@
 - 为新房间准备工作目录，并维护可读的标题链接。
 - 自动归档闲置空白对话，按条件回收已归档的空目录。
 
+## Requirements
+
+- DeepSeek Harness `>=0.2.0-rc.2 <0.3.0-0`（开发与测试基线 `0.2.1-rc.5`）
+
 ## 安装与使用
 
 **v0.1.0 已发布**：[GitHub Release](https://github.com/ZSQBFan/dsh-chat-sessions/releases/tag/v0.1.0)。可从 Release 下载并安装；源码主分支用于后续开发，发布标签保持不变。是否需要重启，以宿主提示为准。

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- 文档：README 增加 Requirements 段，说明宿主版本范围与已验证基线。
+- 清单：`engines` 只保留 `dsh`，移除无运行时作用的 `node`。
+
 ## 0.1.0 — 2026-11-05
 
 - 首次公开发布 GitHub Release，提供独立对话入口与可折叠侧栏分组。

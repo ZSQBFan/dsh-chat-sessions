@@ -11,6 +11,10 @@ A small personal [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harn
 - Working directories for new rooms, with readable title links.
 - Automatic archiving of idle blank chats and conditional cleanup of empty archived directories.
 
+## Requirements
+
+- DeepSeek Harness `>=0.2.0-rc.2 <0.3.0-0` (developed and tested against `0.2.1-rc.5`)
+
 ## Installation and use
 
 **v0.1.0 is released**: [GitHub Release](https://github.com/ZSQBFan/dsh-chat-sessions/releases/tag/v0.1.0). Download the package from the Release to install it; the `main` branch is for continued development and the release tag remains fixed. Follow the host's restart instructions if shown.
