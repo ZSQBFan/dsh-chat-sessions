@@ -1,19 +1,74 @@
-# dsh-chat-sessions
+<p align="center">
+  <img src="icon.svg" width="96" height="96" alt="dsh-chat-sessions logo">
+</p>
 
-[English](README.en.md)
+<h1 align="center">dsh-chat-sessions</h1>
+
+<p align="center">
+  简体中文 · <a href="README.en.md">English</a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/ZSQBFan/dsh-chat-sessions/actions/workflows/ci.yml"><img src="https://github.com/ZSQBFan/dsh-chat-sessions/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
+  <a href="https://github.com/ZSQBFan/dsh-chat-sessions/releases/latest"><img src="https://img.shields.io/github/v/release/ZSQBFan/dsh-chat-sessions?color=247bbf" alt="GitHub Release"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-3da76a" alt="MIT License"></a>
+</p>
+
+<p align="center">
+  <a href="#功能">功能</a> · <a href="#安装">安装</a> · <a href="#注意事项">注意事项</a> · <a href="docs/CONFIGURATION.md">配置参考</a> · <a href="CHANGELOG.md">更新日志</a>
+</p>
+
+---
 
 一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件：一键新建自带独立工作区的会话，让日常问答和小型任务无需手动选择项目目录即可开始。外观与交互贴近 DSH 原生侧栏，融入现有的会话操作习惯。
 
+<p align="center">
+  <img src="docs/assets/overview.gif" width="900" alt="独立对话整体演示">
+</p>
+
 ## 功能
 
-- **一键开始**：从首页的工作区选择入口选择“独立对话”，或点击侧栏独立对话标题右侧的新建按钮，自动准备工作区和工作目录。
-- **集中管理**：独立对话放在可折叠的侧栏分组中，支持切换、置顶、归档与恢复，沿用原生会话菜单、悬停预览与键盘操作。
-- **空白复用与排序**：新建时复用合适的空白对话；分组中空白在前，置顶与普通会话各自按最近活动排序。
-- **文件与会话关联**：维护可读的标题链接，保留待输入或含未发送草稿的空白对话，并在启动时按条件回收已归档的空目录。
+| 功能 | 说明 |
+| --- | --- |
+| **一键开始** | 从首页的工作区选择入口选择“独立对话”，或点击侧栏独立对话标题右侧的新建按钮，自动准备工作区和工作目录。 |
+| **集中管理** | 独立对话放在可折叠的侧栏分组中，支持切换、置顶、归档与恢复，沿用原生会话菜单、悬停预览与键盘操作。 |
+| **空白复用与排序** | 新建时复用合适的空白对话；分组中空白在前，置顶与普通会话各自按最近活动排序。 |
+| **文件与会话关联** | 维护可读的标题链接，保留待输入或含未发送草稿的空白对话，并在启动时按条件回收已归档的空目录。 |
 
-## 安装
+### 功能演示
+
+<details>
+<summary>一键开始</summary>
+
+<p align="center">
+  <img src="docs/assets/one-click.gif" width="900" alt="一键新建独立对话演示">
+</p>
+
+</details>
+
+<details>
+<summary>会话管理</summary>
+
+<p align="center">
+  <img src="docs/assets/session-management.gif" width="900" alt="独立对话会话管理演示">
+</p>
+
+</details>
+
+<details>
+<summary>归档与恢复</summary>
+
+<p align="center">
+  <img src="docs/assets/archive-restore.gif" width="900" alt="独立对话归档与恢复演示">
+</p>
+
+</details>
+
+## Requirements
 
 宿主要求：DeepSeek Harness `>=0.2.0-rc.2 <0.3.0-0`，开发与测试基线为 `0.2.1-rc.5`。
+
+## 安装
 
 当前版本 **v0.1.1**：[GitHub Release](https://github.com/ZSQBFan/dsh-chat-sessions/releases/tag/v0.1.1)。
 
@@ -28,22 +83,25 @@
 - **归档**：v0.1.1 的空白对话由用户手动归档，启动或重新启用插件时也会保留。归档和恢复使用原生会话菜单及归档列表；归档会取消置顶，恢复后可重新置顶。
 - **启动回收**：插件启动或重新启用时，只回收已经归档、没有未归档会话共享的自有空目录（允许仅有 `.DS_Store`）。此操作保留归档状态和会话日志；非空目录保留。
 - **工作目录**：房间位于 `<root>/.sessions/`，标题链接只是文件入口。新房间有独立工作区与目录，派生或后续会话可能共享该目录；独立目录不等于系统沙箱。
-- **后台维护**：约每 15 秒同步标题链接和工作区归属。未发送草稿保存在浏览器中，后台维护不会根据日志闲置时间自动归档。
+- **后台维护**：约每 15 秒同步标题链接和工作区归属。未发送草稿保存在浏览器中。
 - **停用与备份**：通过 DSH 插件页面停用、再次启用或卸载。停用后可能显露底层工作区，房间、日志和已有工作区保留；本版没有自动停用回收或多会话房间退出管理功能。备份时同时保留房间文件和 DSH 的会话、工作区及归档记录。
 
 ## 配置
 
 默认配置即可使用。完整的配置项、默认值、取值范围及示例见[配置参考](docs/CONFIGURATION.md)，包括存放位置、侧栏分组、动效、视觉标记、工作区名称和实验选项。
 
-旧版 `idleMs` 已停用并忽略；当前没有按闲置时间或启动时自动归档空白对话的配置项。
+旧版 `idleMs` 已停用，保留旧配置也不会生效。
 
 ## 更新日志
 
-**v0.1.1** 修复空白对话等待约 90 秒后被自动归档、编辑器退回工作区选择的问题。待输入或含未发送草稿的对话保持可用，启动时继续按条件回收已归档的空目录。
+**v0.1.1** 修复空白对话等待约 90 秒后被自动归档、编辑器退回工作区选择的问题。
 
 完整版本历史见[更新日志](CHANGELOG.md)。
 
 ## 开发检查
+
+<details>
+<summary>开发环境与检查命令</summary>
 
 需要 Node 22 及以上；CI 使用 Node 22。`npm ci` 安装开发依赖后：
 
@@ -52,6 +110,8 @@
 - `npm run test:native`：原生侧栏投影契约，需本机已安装 DSH，并用 `DSH_NATIVE_WORKSPACE_CLIENT` 指向它的 `@deepseek-ai/dsh-client-ui-workspace/lib/client.js`。
 
 `check-*-browser.mjs` 是需要用浏览器手动打开的夹具，不包含在 `npm test` 内；其中成员位移夹具也需设置 `DSH_NATIVE_WORKSPACE_CLIENT`（或 `HARNESS_ROWS_SOURCE`）。CI 配置见 `.github/workflows/ci.yml`。
+
+</details>
 
 ## 兼容与反馈
 
