@@ -9,7 +9,7 @@ A small personal [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harn
 - A collapsible sidebar group for creating, switching, pinning, archiving, and restoring chats.
 - Reuses eligible blank chats. Blanks appear first; pinned and ordinary chats are each sorted by recent activity.
 - Working directories for new rooms, with readable title links.
-- Automatic archiving of idle blank chats and conditional cleanup of empty archived directories.
+- Keeps blank chats available for composing drafts, with conditional cleanup of empty archived directories.
 
 ## Requirements
 
@@ -30,7 +30,7 @@ Defaults work for normal use. Adjust these through DSH's supported plugin-row co
 | Setting | Default | Purpose |
 | --- | --- | --- |
 | `root` | Empty string | Room storage: `$DSH_HOME/chats`, or `~/.dsh/chats` when `DSH_HOME` is unset. Use an absolute path for a custom location |
-| `idleMs` | `90000` | Idle archive threshold for message-free blank chats, in milliseconds; `0` does not disable maintenance |
+| `idleMs` | Retired | Former idle archive threshold; now ignored. Archive blank chats manually |
 | `flattenUngrouped` | `true` | Present standalone chats as a flattened sidebar group |
 | `glideMotion` | `auto` | `auto` follows reduced-motion preferences, `off` disables plugin glides, and `force` permits them regardless of that preference |
 
@@ -40,8 +40,8 @@ Leave other options at their defaults. Changing `root` does not migrate existing
 
 Rooms live under `<root>/.sessions/`; title links are file shortcuts. The plugin registers native workspaces behind the scenes for composition and archiving. Derived or subsequent sessions may share a directory. A separate directory is not a system sandbox.
 
-- Archiving preserves session logs and files. An expired blank chat without new activity may be archived again after restoration.
-- Maintenance runs roughly every 15 seconds. Idle archiving applies to non-running blank chats with no user or assistant messages.
+- Archiving preserves session logs and files. Archive blank chats manually; restored chats stay available.
+- Maintenance synchronizes title links and workspace membership roughly every 15 seconds. Unsent drafts live in the browser, so maintenance never archives a chat based on its log's idle time.
 - Startup maintenance may reclaim owned empty archived directories with no unarchived session sharing them (`.DS_Store` alone is allowed). Nonempty directories and session logs remain.
 - Disabling or uninstalling does not automatically remove rooms, logs, or existing workspaces. Back up room files along with DSH's session, workspace, and archive records.
 

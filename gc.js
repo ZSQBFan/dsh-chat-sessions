@@ -8,19 +8,15 @@
  *   DeleteSessionPolicy = 'archive' | 'keep'   // default 'archive'
  *   archiveSessionQuietly() → ctx.workspaceRegistry.archiveSession(sessionId)
  *
- * So this module never deletes a session record. It has two halves that match the two
- * PRD acceptance items:
+ * The automatic maintenance sweep only reclaims empty cwds of sessions already
+ * archived through the native UI. It never infers abandonment from message counts
+ * or log timestamps: an unsent browser draft has neither a durable message nor a
+ * fresh log timestamp. This also applies when the plugin is activated again.
  *
- *   - runtime (A6's visible half): a standalone session that never received a
- *     message and has been idle long enough is ARCHIVED through the public registry
- *     API, which is exactly what removes the row from the sidebar (the default
- *     archived filter hides archived sessions). Archiving is one-way on purpose: the
- *     archive flag belongs to the user, so a manual archive of a real conversation is
- *     never undone by this sweep (that reversal was a bug: the row came back).
- *   - boot (A6's disk half): the empty cwd directory of an archived session is removed,
- *     but only when its name is still `session-<uuid>` and it holds nothing but Finder
- *     droppings; `rmdir` is the second guard, since it refuses a non-empty directory
- *     instead of taking files with it and can never recurse.
+ * `IDLE_MS`, `decide` and `idleSince` remain exported for compatibility with the
+ * public ./gc module, but the host no longer uses them to change archive flags.
+ * Directory reclamation accepts only `session-<uuid>` cwds and uses non-recursive
+ * `rmdir` after checking for files (Finder droppings are tolerated).
  *
  * Filesystem-only, node builtins only, so check.mjs can drive it against a throwaway dir.
  */
@@ -33,12 +29,12 @@ export const IDLE_MS = 90_000;
 const SESSION_DIR = /^session-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 
 /**
- * What to do with one standalone session this sweep.
+ * Legacy threshold policy retained for the public ./gc export; not used by automatic maintenance.
  *
- * "Empty" means the log holds no message at all — neither a `user/message` nor an
- * `assistant/message` — which is the durable reading of PRD A6 (a session the user opened,
- * never typed in, and left). A session that ever produced a message is never reclaimed, and
- * a real conversation is always pulled back out of the archive. Running sessions are untouchable.
+ * "Empty" means the log holds no user or assistant messages, which does not establish
+ * whether a browser has an active composer or saved draft. Callers must not use this
+ * policy alone to automatically archive sessions. Running or archived sessions and
+ * conversations with messages are kept.
  * @param state `{ userMessages, assistantMessages, running, archived, idleMs }` for one session.
  * @returns 'archive' | 'keep'.
  */
