@@ -30,7 +30,7 @@ import {
   slugify,
   tidyLinks,
 } from './links.js';
-import { IDLE_MS, decide, idleSince, isSessionDirName, reclaimEmptyDir, sessionDirPath } from './gc.js';
+import { isSessionDirName, reclaimEmptyDir, sessionDirPath } from './gc.js';
 
 export const name = 'chat-sessions';
 
@@ -45,7 +45,7 @@ const ROUTE_PREFIX = '/chat-sessions';
  * client writes it into `<html data-chat-sessions-build>` and echoes it back with every
  * diagnostics sample, so a report can never compare two different stamps again (round 5 item 2).
  */
-export const PLUGIN_BUILD = 'chip-icon-2026-11-04-keyboard-actions';
+export const PLUGIN_BUILD = 'blank-draft-preservation-2026-11-06';
 /** Every standalone session directory is named after its session id. */
 const SESSION_PREFIX = 'session-';
 /**
@@ -244,8 +244,6 @@ function seedFirstTurn(session) {
 export function apply(ctx, config) {
   const root = chatRoot(config);
   const sessionsRoot = join(root, '.sessions');
-  /** How long a message-free session must sit idle before the sweep archives it. */
-  const idleThreshold = Number.isFinite(config?.idleMs) && config.idleMs >= 0 ? config.idleMs : IDLE_MS;
   /** Every spelling of `<root>/.sessions` a cwd may carry; filled on first async use. */
   let sessionsRoots = [sessionsRoot];
 
@@ -585,37 +583,6 @@ export function apply(ctx, config) {
   }
 
   /**
-   * Archive one session through the public registry API.
-   *
-   * Archive is what removes the row from the sidebar (the default archived filter hides it). The
-   * registry refuses while work is running, so an in-flight turn is never touched — the decision is
-   * retried on the next sweep. Unarchiving is deliberately not part of any sweep: the flag belongs
-   * to the user (`/chat-sessions/unarchive` is a maintenance door, not a sweep step).
-   */
-  async function applyDecision(sessionId, action) {
-    try {
-      if (action === 'archive') await ctx.workspaceRegistry.archiveSession(sessionId);
-      else await ctx.workspaceRegistry.unarchiveSession(sessionId);
-      return action;
-    } catch (error) {
-      ctx.logger?.warn?.(`[chat-sessions] ${action} failed for ${sessionId}: ${messageOf(error)}`);
-      return 'error';
-    }
-  }
-
-  /**
-   * Bring every standalone session up to date: title link (A4/A5/A9), archive state (A6).
-   *
-   * `session/title` is last-wins and only exists once a title has been generated, so a link
-   * cannot be created at `create` time. Reclamation follows PRD A6 and only ever touches a
-   * session the host still reports as `blank`; `user/message` stays the signal that pulls a
-   * session back out of the archive. With `boot`, empty archived cwds are also reclaimed
-   * from disk.
-   * @param only optional subset of session ids to sweep; all standalone sessions by default.
-   * @param options `{ boot }` enables the one-shot disk reclamation.
-   * @returns one report per session that currently has a title or changed archive state.
-   */
-  /**
    * Registry-only pass: a receipt workspace (one per standalone room) must always carry the
    * neutral title.
    *
@@ -658,11 +625,11 @@ export function apply(ctx, config) {
     return reports;
   }
 
+  /** Sync links and membership without changing archive flags; boot also reclaims archived empty cwds. */
   function sweep(only, options = {}) {
     const run = async () => {
       const durable = await ctx.sessionPersistence.list();
       const archived = new Set(ctx.workspaceRegistry.archivedSessionIds);
-      const summaries = await runningSessions();
       const reports = [];
       for (const snapshot of durable) {
         const sessionId = snapshot.header.id;
@@ -671,26 +638,14 @@ export function apply(ctx, config) {
         const facts = await logFacts(sessionId, snapshot.sizeBytes);
         if (facts === null) continue;
 
-        const wasArchived = archived.has(sessionId);
-        const summary = summaries.get(sessionId);
-        const action = decide({
-          userMessages: facts.userMessages,
-          assistantMessages: facts.assistantMessages,
-          running: summary?.running === true,
-          archived: wasArchived,
-          idleMs: idleSince(facts.lastTime),
-          thresholdMs: idleThreshold,
-        });
-        if (action !== 'keep') {
-          const applied = await applyDecision(sessionId, action);
-          if (applied !== 'error') reports.push({ status: applied, sessionId });
-        }
+        // Message-free logs do not imply abandonment: selection and unsent drafts live
+        // in the browser. Respect the native archive flag, including during plugin activation.
+        const nowArchived = archived.has(sessionId);
 
         // Native archive filtering requires workspace membership; archival changes visibility,
         // not ownership. Older builds deleted receipts, so reconcile them without unarchiving.
         const directory = await directoryOf(snapshot);
         const linkName = basename(directory);
-        const nowArchived = wasArchived || action === 'archive';
         if (nowArchived) {
           try {
             await ensureSessionWorkspace(sessionId, snapshot.header.cwd, true);

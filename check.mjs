@@ -496,7 +496,7 @@ try {
    */
   if (!clientSource.includes("const BUILD_ATTRIBUTE = 'data-chat-sessions-build';")) {
     fail('the client must expose which build is live');
-  } else if (!hostSource.includes("export const PLUGIN_BUILD = 'chip-icon-2026-11-04-keyboard-actions';")) {
+  } else if (!hostSource.includes("export const PLUGIN_BUILD = 'blank-draft-preservation-2026-11-06';")) {
     fail('the build id must be bumped with the behaviour change');
   } else if (!hostSource.includes('build: PLUGIN_BUILD,')) {
     fail('GET /chat-sessions/config must publish the build id');
