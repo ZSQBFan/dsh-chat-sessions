@@ -30,10 +30,9 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin tha
 
 | Feature | Description |
 | --- | --- |
-| **Start in one click** | Choose the standalone chat entry in the home page workspace picker, or use the new-chat button beside the standalone sidebar heading. The plugin prepares the workspace and working directory for you. |
-| **Manage chats together** | A collapsible sidebar group supports switching, pinning, archiving, and restoring chats, with native session menus, hover previews, and keyboard controls. |
-| **Reuse and sort** | Reuses eligible blank chats. Blanks appear first; pinned and ordinary chats are each sorted by recent activity. |
-| **Keep files connected** | Maintains readable title links, keeps blank chats available while composing unsent drafts, and conditionally reclaims empty archived directories at startup. |
+| **One click, a workspace of its own** | Start a chat with its own workspace in one click. Files from different tasks stay in separate working directories, without having to choose a project directory first. |
+| **Familiar session controls** | Interactions follow native DSH. Switch, pin, archive, and restore chats the way you already know, with no new workflow to learn. |
+| **Files that are easy to find** | File shortcuts are organized by chat title, making it easy to find the files created in a conversation and open, edit, or reuse them later. |
 
 ### Feature demos
 
