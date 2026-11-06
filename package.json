@@ -46,6 +46,8 @@
     "locale/*.json",
     "icon.svg",
     "README.en.md",
+    "docs/CONFIGURATION.md",
+    "docs/CONFIGURATION.en.md",
     "CHANGELOG.md"
   ],
   "dsh": {

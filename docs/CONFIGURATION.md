@@ -1,0 +1,54 @@
+# 配置参考
+
+[返回 README](../README.md) · [English](CONFIGURATION.en.md)
+
+以下为 v0.1.1 实现读取的全部插件配置：6 个常用项、2 个实验选项，以及已停用的 `idleMs`。未填写时采用默认值。
+
+## 设置方式
+
+通过 DSH 支持的插件配置方式，设置 `chat-sessions` 插件行的 `config`。下面仅展示 `config` 的内容，无需为每项显式填写默认值：
+
+```yaml
+root: ''
+flattenUngrouped: true
+glide: true
+glideMotion: auto
+treeBadge: icon
+untitledWorkspaceTitle: 独立对话
+ownership: workspace
+seedFirstTurn: false
+```
+
+保存后按宿主提示重新加载插件或重启 DSH；前端配置在插件客户端加载时读取。
+
+## 常用项
+
+| 配置项 | 类型 / 可选值 | 默认值 | 说明 |
+| --- | --- | --- | --- |
+| `root` | 字符串 | `''` | 房间存放位置。留空时使用 `$DSH_HOME/chats`，未设置 `DSH_HOME` 时用 `~/.dsh/chats`。自定义时填写绝对路径；不展开 `~` 或环境变量，更改此项不会迁移旧数据。 |
+| `flattenUngrouped` | 布尔值 | `true` | 启用独立对话侧栏分组，展平插件管理的工作区。设为 `false` 时保留原生工作区分组，不启用插件的侧栏分组整理；后台工作区与目录维护仍运行。 |
+| `glide` | 布尔值 | `true` | 插件侧栏滑行动效的总开关。设为 `false` 时关闭插件滑行，即使 `glideMotion` 为 `force` 也不播放。 |
+| `glideMotion` | `auto` / `off` / `force` | `auto` | `auto` 遵循系统或浏览器的减少动态效果偏好；`off` 关闭插件滑行；`force` 忽略该偏好并允许滑行，仍受 `glide` 控制。 |
+| `treeBadge` | `icon` / `tint` / `off` | `icon` | 树形视图中，独立对话嵌套在其他工作区下时的视觉标记。`icon` 添加对话图标；`tint` 降低会话行不透明度，悬停时恢复；`off` 关闭该标记。 |
+| `untitledWorkspaceTitle` | 非空字符串 | `独立对话` | 插件创建的底层工作区及输入区工作区标签的名称。名称保持独立于会话标题；维护会将已有受管工作区的名称同步为此值。空字符串或非字符串使用默认值。 |
+
+`glide` 和 `glideMotion` 只控制插件添加的滑行，不接管 DSH 自带的全部动画。`flattenUngrouped: false` 时，侧栏分组整理及其滑行、树形标记不启用。
+
+## 实验选项
+
+这两项用于实现验证，日常使用请保持默认值。
+
+| 配置项 | 类型 / 可选值 | 默认值 | 行为与限制 |
+| --- | --- | --- | --- |
+| `ownership` | `workspace` / `bare` | `workspace` | `workspace` 为新房间注册原生工作区，支持原生输入区。`bare` 创建没有工作区归属的会话；当前宿主依赖工作区来开放输入区，此模式不适合日常对话。切换此项不构成已有数据的迁移或退出管理操作。 |
+| `seedFirstTurn` | 布尔值 | `false` | 仅在显式设为 `true` 时，为新建会话写入一个空的首轮，不作用于复用的空白会话。已知会与原生首轮编号冲突，后续读取可能报 `SessionFormatError: turn/start does not open the expected turn`，请保持关闭。 |
+
+## 已停用项
+
+| 配置项 | 状态 | 说明 |
+| --- | --- | --- |
+| `idleMs` | v0.1.1 起忽略 | 旧版按日志闲置时间自动归档的阈值。保留旧配置不会生效，也不会启用启动归档。 |
+
+v0.1.1 的空白会话由用户手动归档；插件启动或重新启用时保留未归档会话。启动维护只回收**已经归档**、没有未归档会话共享的自有空目录（允许仅有 `.DS_Store`），保留会话日志与归档状态。自动回收目录与将会话归档是两个操作。
+
+除上表外，目前没有闲置归档、启动自动归档、轮询间隔或空目录回收开关等插件配置项。`DSH_HOME` 是宿主环境变量，影响默认 `root`，不属于插件行的配置字段。
