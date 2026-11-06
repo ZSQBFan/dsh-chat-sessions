@@ -17,7 +17,14 @@ A small personal [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harn
 
 ## Installation and use
 
-**v0.1.0 is released**: [GitHub Release](https://github.com/ZSQBFan/dsh-chat-sessions/releases/tag/v0.1.0). Download the package from the Release to install it; the `main` branch is for continued development and the release tag remains fixed. Follow the host's restart instructions if shown.
+Current version: **v0.1.1**, available from [GitHub Release](https://github.com/ZSQBFan/dsh-chat-sessions/releases/tag/v0.1.1).
+
+1. Download `dsh-chat-sessions-0.1.1.tgz` from the Release (a SHA256 checksum file is included separately).
+2. In DSH's plugin page, choose “Add plugin”, enter the downloaded file's absolute path, install, and enable it. Reload or restart as prompted by the host.
+
+v0.1.1 fixes blank chats being automatically archived after roughly 90 seconds, keeping chats available while you compose an unsent draft. Keep your existing `root` configuration when upgrading. Chats already archived by an older version can be restored manually from the native archived list. See the [changelog](CHANGELOG.md) for all changes.
+
+The `main` branch is for continued development. For a fixed version, use the package attached to its Release.
 
 Choose the standalone chat entry in the home page workspace picker, or use the new-chat button beside the standalone sidebar heading. Archive and restore through the native session menu and archived list. Archiving removes a pin; pin the chat again after restoring if needed.
 

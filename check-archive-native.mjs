@@ -52,7 +52,7 @@ function projectedGroups(api, list, workspace, filter) {
     { expandedGroups: workspace.items.map(w => w.workspaceId), ungroupedOrder: [] });
 }
 
-test('B2-F001: auto-archived noncurrent blank survives reload and native single restore without changing data', async () => {
+test('B2-F001: previously archived noncurrent blank survives reload and native single restore without changing data', async () => {
   const f = await fixture();
   try {
     const a = await f.add(21, { message: false });
@@ -65,8 +65,12 @@ test('B2-F001: auto-archived noncurrent blank survives reload and native single 
     f.snapshots.find(s => s.header.id === a.id).header.createdAt = Date.now() - 200_000;
     f.events.get(a.id).forEach(e => e.time = Date.now() - 200_000);
     const storedLog = JSON.stringify(f.events.get(a.id));
-    await f.request(); // Maintenance chooses archive; no direct archive mutation for a.
-    assert.ok(f.archived.has(a.id), 'maintenance actually archived the blank');
+    await f.request();
+    assert.equal(f.archived.has(a.id), false, 'maintenance preserves the expired blank');
+    // Reproduce an archive left by an older version or a manual native action.
+    await f.registry.archiveSession(a.id);
+    await f.request();
+    assert.ok(f.archived.has(a.id), 'maintenance respects the existing archive');
     const workspaceId = f.workspaces.find(w => w.sessionIds.includes(a.id)).id;
     const state = () => ({
       list: { projectionsBySession: {}, ids: f.snapshots.map(s => s.header.id), byId: Object.fromEntries(f.snapshots.map(s => [s.header.id,
@@ -82,6 +86,8 @@ test('B2-F001: auto-archived noncurrent blank survives reload and native single 
     assert.ok(rowIds(projectedGroups(api, live.list, live.workspace, 'only')).includes(a.id));
     assert.ok(rowIds(projectedGroups(api, live.list, live.workspace, 'show')).includes(a.id));
     await f.registry.unarchiveSession(a.id); // The same public per-session operation the native menu uses.
+    await f.request();
+    assert.equal(f.archived.has(a.id), false, 'restored blank stays available after maintenance');
     live = state();
     assert.ok(!rowIds(projectedGroups(api, live.list, live.workspace, 'only')).includes(a.id));
     assert.ok(!rowIds(projectedGroups(api, live.list, live.workspace, 'default')).includes(a.id), 'restored noncurrent blank follows native visibility');

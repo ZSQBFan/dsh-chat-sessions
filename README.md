@@ -17,7 +17,14 @@
 
 ## 安装与使用
 
-**v0.1.0 已发布**：[GitHub Release](https://github.com/ZSQBFan/dsh-chat-sessions/releases/tag/v0.1.0)。可从 Release 下载并安装；源码主分支用于后续开发，发布标签保持不变。是否需要重启，以宿主提示为准。
+当前版本 **v0.1.1**：[GitHub Release](https://github.com/ZSQBFan/dsh-chat-sessions/releases/tag/v0.1.1)。
+
+1. 从 Release 下载 `dsh-chat-sessions-0.1.1.tgz`（另附 SHA256 校验文件）。
+2. 在 DSH「插件 → 添加插件」中填写下载文件的绝对路径，安装并启用；按宿主提示重新加载或重启。
+
+v0.1.1 修复空白对话等待约 90 秒后被自动归档的问题，待输入或含未发送草稿的对话会保持可用。升级时保留原有 `root` 配置；旧版已经归档的会话可从原生归档列表手动恢复。完整变更见[更新记录](CHANGELOG.md)。
+
+`main` 分支用于后续开发，固定版本请使用对应 Release 的安装包。
 
 启用后，从首页的工作区选择入口选择“独立对话”，或点击侧栏独立对话标题右侧的新建按钮。归档和恢复使用原生会话菜单及归档列表；归档会取消置顶，恢复后可重新置顶。
 
