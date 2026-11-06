@@ -4,8 +4,11 @@
   "type": "module",
   "scripts": {
     "check": "node check.mjs",
-    "test": "node --test check-create.mjs check-archive.mjs check-header.mjs check-gc.mjs",
+    "test": "node --test check-create.mjs check-archive.mjs check-header.mjs check-gc.mjs check-lifecycle-store.mjs check-lifecycle.mjs check-lifecycle-legacy.mjs",
     "test:native": "node --test check-archive-native.mjs",
+    "test:lifecycle": "node --test check-lifecycle.mjs",
+    "test:lifecycle:native": "node --test check-lifecycle-native.mjs",
+    "test:lifecycle:e2e": "node --test check-lifecycle-e2e.mjs",
     "verify": "npm run check && npm test"
   },
   "description": "Standalone chats without choosing a project workspace first: the plugin maintains native workspaces in the background, a new room gets a working directory, and derived sessions may share it.",
@@ -35,7 +38,9 @@
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg",
     "./links": "./links.js",
-    "./gc": "./gc.js"
+    "./gc": "./gc.js",
+    "./lifecycle/model": "./lifecycle/model.js",
+    "./lifecycle/store": "./lifecycle/store.js"
   },
   "files": [
     "index.js",
@@ -48,7 +53,14 @@
     "README.en.md",
     "docs/CONFIGURATION.md",
     "docs/CONFIGURATION.en.md",
-    "CHANGELOG.md"
+    "CHANGELOG.md",
+    "lifecycle/*.js",
+    "check-lifecycle.mjs",
+    "check-lifecycle-store.mjs",
+    "check-lifecycle-legacy.mjs",
+    "check-lifecycle-native.mjs",
+    "check-lifecycle-e2e.mjs",
+    "test-support/*.mjs"
   ],
   "dsh": {
     "bundle": {

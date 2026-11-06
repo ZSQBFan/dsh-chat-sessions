@@ -304,6 +304,14 @@ window.__ModuleLoader__.load({
     /** Host-reported count of sessions no workspace claims (see `status().orphans`). */
     let knownOrphans = 0;
     /**
+     * 插件自己声明的托管集合（`/chat-sessions/status` 的 `managedWorkspaceIds`）。
+     *
+     * `null` = 服务端没有给这份清单（旧版本宿主/离线），退回路径形状判断；
+     * 一旦拿到清单就只认清单：用户自己建的、路径长得像 `.sessions/session-*` 的工作区
+     * 不会被压平成插件的房间，停用后脱管的会话也不会继续被装饰。
+     */
+    let managedWorkspaceIds = null;
+    /**
      * Set on the block container that holds the groups. Needed because reordering by CSS `order`
      * requires turning that container into a flex column — and a flex column *shrinks* its children
      * by default when the content is taller than the scroll box, which made the whole workspace
@@ -732,6 +740,10 @@ window.__ModuleLoader__.load({
      * @returns true for `<...>/.sessions/session-<uuid>` registrations.
      */
     function isReceiptWorkspace(workspace) {
+      // 有明确托管集合时以它为准；只有拿不到清单时才退回路径形状（旧行为）。
+      if (managedWorkspaceIds !== null) {
+        return typeof workspace?.id === 'string' && managedWorkspaceIds.has(workspace.id);
+      }
       const path = workspace?.path;
       if (typeof path !== 'string') return false;
       return /\.sessions\/session-[0-9a-fA-F-]{8,}$/u.test(path);
@@ -2089,6 +2101,13 @@ window.__ModuleLoader__.load({
         const payload = await response.json();
         const workspaces = Array.isArray(payload?.workspaces) ? payload.workspaces : [];
         const sessions = Array.isArray(payload?.sessions) ? payload.sessions : [];
+        // 服务端自 0.2.0 起给出明确托管集合；拿不到时保持 null（退回路径判断）。
+        managedWorkspaceIds = Array.isArray(payload?.managedWorkspaceIds)
+          ? new Set(payload.managedWorkspaceIds.filter((id) => typeof id === 'string'))
+          : null;
+        const managedSessionIds = Array.isArray(payload?.managedSessionIds)
+          ? new Set(payload.managedSessionIds.filter((id) => typeof id === 'string'))
+          : null;
         // Reported by the host: a collapsed 「未分组」 renders no rows, so DOM counting alone would
         // mistake "hidden because collapsed" for "empty" and delete the header for good.
         knownOrphans = typeof payload?.orphans === 'number' ? payload.orphans : 0;
@@ -2118,6 +2137,11 @@ window.__ModuleLoader__.load({
           if (typeof session?.sessionId !== 'string') continue;
           // Keep the room as the *directory*, not the workspace row: an archived room keeps its
           // session but no longer has a workspace, and the flat list still shows that session.
+          if (managedSessionIds !== null) {
+            // 脱管（DETACHED/RELEASED）的会话不在清单里：把它交回原生视图，不再加插件标记。
+            if (managedSessionIds.has(session.sessionId)) standaloneIds.add(session.sessionId);
+            continue;
+          }
           const cwd = typeof session?.cwd === 'string' ? session.cwd : '';
           if (cwd.startsWith(prefix) || cwd.includes('/.sessions/')) standaloneIds.add(session.sessionId);
         }
