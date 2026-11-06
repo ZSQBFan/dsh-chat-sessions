@@ -20,7 +20,7 @@
 
 ---
 
-一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件：一键新建自带独立工作区的会话，让日常问答和小型任务无需手动选择项目目录即可开始。外观与交互贴近 DSH 原生侧栏，融入现有的会话操作习惯。
+一个 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 插件：一键新建自带独立工作区的会话，让日常问答和小型任务无需手动选择项目目录即可开始，同时各个会话产生的文件不会相互影响。外观与交互贴近 DSH 原生侧栏，融入现有的会话操作习惯。
 
 <p align="center">
   <img src="docs/assets/overview.gif" width="900" alt="独立对话整体演示">
