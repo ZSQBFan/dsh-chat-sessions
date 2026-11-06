@@ -37,14 +37,14 @@ test('archive links resolve across moves and legacy relative targets are repaire
  }finally{await f.close();}
 });
 
-test('boot reclamation removes links but retains native archived membership; later sweeps do not recreate dangling links',async()=>{
+test('boot keeps archived rooms on disk and retains native archived membership across restarts',async()=>{
  const f=await fixture();try{const a=await f.add(4);await f.request();f.archived.add(a.id);await f.restart();
- await assert.rejects(stat(a.directory),{code:'ENOENT'});
+ // 取消自动 GC：boot 不再删目录，归档只影响入口位置。
+ assert.equal((await stat(a.directory)).isDirectory(),true);
  assert.ok(f.workspaces.some(w=>w.sessionIds.includes(a.id)));
  for(let i=0;i<2;i++) await f.request();
- const names=await readdir(join(f.root,'.archive')).catch(()=>[]);assert.deepEqual(names.filter(n=>!n.startsWith('.')),[]);
- await f.registry.unarchiveSession(a.id);await f.request();
  assert.equal((await stat(a.directory)).isDirectory(),true);
+ await f.registry.unarchiveSession(a.id);await f.request();
  assert.equal(await realpath(join(f.root,'Room-4')),a.directory);
  }finally{await f.close();}
 });
@@ -69,14 +69,20 @@ test('reclaimed title survives a collision and restoration never overwrites anot
  }finally{await f.close();}
 });
 
-test('reclaim clears all owned legacy aliases without deleting unrelated files or links',async()=>{
+test('archiving no longer reclaims the room: directory, aliases and unrelated files stay',async()=>{
  const f=await fixture();try{const a=await f.add(10);await f.request();await mkdir(join(f.root,'.archive'),{recursive:true});
  await symlink(a.target,join(f.root,'.archive','legacy'));
  await symlink(`../${a.target}`,join(f.root,'.archive','duplicate'));
  await writeFile(join(f.root,'.archive','keep.txt'),'keep');
  f.archived.add(a.id);await f.restart();await f.request();
- assert.deepEqual((await readdir(join(f.root,'.archive'))).sort(),['keep.txt']);
+ // 取消自动目录 GC 后的语义：归档只挪标题入口，房间目录必须原地保留。
+ assert.equal((await stat(a.directory)).isDirectory(),true);
  assert.equal(await readFile(join(f.root,'.archive','keep.txt'),'utf8'),'keep');
+ // 房间入口要么已挪进 `.archive/`，要么因为归档目录里已有手制链接而留在原位：
+ // 两种都算「有个能点回去的名字」，重要的是目录和文件没被动过。
+ const names=[...(await readdir(join(f.root,'.archive'))).filter(n=>n!=='keep.txt'),...(await readdir(f.root)).filter(n=>n.startsWith('Room-'))];
+ const resolved=await Promise.all(names.map(n=>realpath(join(f.root,'.archive',n)).catch(()=>realpath(join(f.root,n)).catch(()=>null))));
+ assert.ok(resolved.includes(a.directory), '至少一个入口仍指向原房间');
  }finally{await f.close();}
 });
 

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { stat, realpath } from 'node:fs/promises';
+import { lstat, stat, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fixture } from './test-support/archive-fixture.mjs';
 
@@ -42,7 +42,7 @@ test('restoring an expired blank remains effective across runtime maintenance', 
   } finally { await f.close(); }
 });
 
-test('activation preserves expired blanks, missing timestamps and conversations; only archived empty cwds are reclaimed', async () => {
+test('activation preserves expired blanks, missing timestamps, conversations and archived empty cwds', async () => {
   const f = await fixture();
   try {
     const expired = await f.add(103, { message: false });
@@ -56,7 +56,9 @@ test('activation preserves expired blanks, missing timestamps and conversations;
     for (let i = 0; i < 2; i++) {
       await f.restart();
       assert.equal(f.archived.has(archived.id), true);
-      await assert.rejects(stat(archived.directory), { code: 'ENOENT' });
+      // 生命周期交接要求目录保留：归档只挪走标题入口，房间本身留在磁盘上。
+      assert.equal((await stat(archived.directory)).isDirectory(), true);
+      assert.equal((await lstat(join(f.root, '.archive', 'Room-106'))).isSymbolicLink(), true);
       for (const kept of [expired, noTimestamp, conversation]) {
         assert.equal(f.archived.has(kept.id), false);
         assert.equal((await stat(kept.directory)).isDirectory(), true);

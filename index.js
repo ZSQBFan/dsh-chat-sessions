@@ -30,7 +30,10 @@ import {
   slugify,
   tidyLinks,
 } from './links.js';
-import { isSessionDirName, reclaimEmptyDir, sessionDirPath } from './gc.js';
+import { isSessionDirName, sessionDirPath } from './gc.js';
+import { PROCESS_STATE, canonicalPath } from './lifecycle/model.js';
+import { LedgerStore, effectiveDshHome } from './lifecycle/store.js';
+import { LifecycleCoordinator } from './lifecycle/coordinator.js';
 
 export const name = 'chat-sessions';
 
@@ -261,6 +264,71 @@ export function apply(ctx, config) {
 
   ctx.logger?.info?.(`[chat-sessions] host half loaded; root=${root}`);
 
+  // ── lifecycle scope ───────────────────────────────────────────────────────────
+  // 账本按「稳定 profile 名 + canonical root」定位（见 lifecycle/model.js 的 scopeIdentity），
+  // 不用端口、PID 或启动时间：普通重启 / HMR / 无关配置刷新必须落进同一个 scope，
+  // 否则已经登记的房间会被当成陌生数据，交接与恢复都无从谈起。
+  // `profileContext` 由宿主 app-boot 提供（`{name, dir, ...}`），停用期间依然可读。
+  const lifecycleLog = (event) => ctx.logger?.info?.(`[chat-sessions] lifecycle ${JSON.stringify(event)}`);
+  // 只有真宿主 ctx（有 `get`）才开账本。测试夹具、jsdom、mock dispose 这类没有宿主上下文的
+  // 环境必须完全跳过生命周期层：它们拿不到 profile 身份，更不能往真实 `~/.dsh` 写账本。
+  const lifecycleEnabled = typeof ctx?.get === 'function';
+  const profileContext = lifecycleEnabled ? ctx.get('profileContext') : undefined;
+  const profileId = typeof profileContext?.name === 'string' && profileContext.name !== ''
+    ? profileContext.name
+    : 'unknown-profile';
+  let coordinator;
+  /** 开账本 → 对账 creation intent → 恢复上次未完成的交接。失败只降级，不阻塞插件装载。 */
+  const lifecycleReady = (async () => {
+    if (!lifecycleEnabled) return { ok: false, blocked: 'NO_HOST_CONTEXT' };
+    const store = await LedgerStore.open({
+      dshHome: effectiveDshHome(),
+      profileId,
+      canonicalRoot: canonicalPath(root),
+      pluginId: 'dsh-chat-sessions',
+    });
+    coordinator = new LifecycleCoordinator({ ctx, config, store, log: lifecycleLog });
+    const outcome = await coordinator.start();
+    if (outcome.ok === false) ctx.logger?.warn?.(`[chat-sessions] lifecycle blocked: ${outcome.blocked}`);
+    return outcome;
+  })().catch((error) => {
+    ctx.logger?.warn?.(`[chat-sessions] lifecycle unavailable: ${messageOf(error)}`);
+    return { ok: false, blocked: 'LIFECYCLE_UNAVAILABLE' };
+  });
+
+  /** 写入口闸门：启动恢复中、正在停用、账本坏掉或锁被占用时都不接受新写。 */
+  async function lifecycleWritable() {
+    if (!lifecycleEnabled) return true;
+    await lifecycleReady;
+    return coordinator !== undefined && coordinator.canWrite();
+  }
+
+  /** 统一的「未就绪」错误，路由据此答 409 而不是 500。 */
+  function notReadyError() {
+    const error = new Error('lifecycle not ready');
+    error.code = 'LIFECYCLE_NOT_READY';
+    return error;
+  }
+
+  // 交接 disposer：注册得早 → 冻结得早，从这一刻起插件不再接受新写；
+  // 已接收的任务在 `drain()` 里等它自己结束（不杀 Agent 回合）。
+  // 原生管理器确实 await 异步 disposer（G0-01：1683ms ≈ 1500ms barrier + 开销），
+  // 所以账本可以写完再让卸载返回；失败只记进账本，绝不抛出到宿主。
+  if (lifecycleEnabled) {
+    ctx.effect(() => async () => {
+      await lifecycleReady;
+      if (coordinator === undefined) return;
+      try {
+        await coordinator.detach();
+      } catch (error) {
+        ctx.logger?.warn?.(`[chat-sessions] lifecycle detach failed: ${messageOf(error)}`);
+      } finally {
+        // 释放单 writer 锁：下次启用/重装必须能直接接管同一个 scope。
+        await coordinator.close();
+      }
+    }, 'chat-sessions: lifecycle handoff');
+  }
+
   /**
    * Create one standalone session: real directory first, then the session bound to it.
    * @returns the created session id and its real cwd.
@@ -268,28 +336,35 @@ export function apply(ctx, config) {
   async function createStandaloneSession() {
     const sessionId = `${SESSION_PREFIX}${randomUUID()}`;
     const cwd = join(sessionsRoot, sessionId);
-    await mkdir(cwd, { recursive: true });
-    const ownership = ownershipOf(config);
-    // `workspace`: the directory is registered as its own workspace and the session joins it —
-    // DSH only hands the native composer to a session that belongs to a workspace (README §11),
-    // and `create` rejects `workspaceId` + `cwd` together, so exactly one of them is sent.
+    const canonicalCwd = canonicalPath(cwd);
+    if (!(await lifecycleWritable())) throw notReadyError();
+    // 先落创建意图再建原生对象：崩在中间只会留下一条 PENDING 意图（启动对账时判 ABANDONED），
+    // 不会出现「目录在、房间没登记」或「房间登记了、成员没挂上」的半个房间。
+    if (coordinator !== undefined) await coordinator.beginCreate({ sessionId, cwd, canonicalCwd });
     let workspaceId;
-    if (ownership === OWNERSHIP_WORKSPACE) {
-      // The receipt workspace title is what the composer's workspace chip shows before the session
-      // has a title of its own; the raw `session-<uuid>` there reads like a bug, so a neutral label
-      // is used and later replaced by the session title (`sweep()`).
-      workspaceId = (await ctx.workspaceRegistry.create(cwd, untitledWorkspaceTitle(config))).id;
-    }
     let created;
     try {
+      await mkdir(cwd, { recursive: true });
+      const ownership = ownershipOf(config);
+      // `workspace`: the directory is registered as its own workspace and the session joins it —
+      // DSH only hands the native composer to a session that belongs to a workspace (README §11),
+      // and `create` rejects `workspaceId` + `cwd` together, so exactly one of them is sent.
+      if (ownership === OWNERSHIP_WORKSPACE) {
+        // The receipt workspace title is what the composer's workspace chip shows before the session
+        // has a title of its own; the raw `session-<uuid>` there reads like a bug, so a neutral label
+        // is used and later replaced by the session title (`sweep()`).
+        workspaceId = (await ctx.workspaceRegistry.create(cwd, untitledWorkspaceTitle(config))).id;
+      }
       created = await ctx.sessionController.create(
         workspaceId === undefined ? { sessionId, cwd } : { sessionId, workspaceId },
       );
     } catch (error) {
       // The directory exists for the session's sake: never leave a half-registered workspace behind.
+      if (coordinator !== undefined) await coordinator.abortCreate({ sessionId }).catch(() => {});
       if (workspaceId !== undefined) await ctx.workspaceRegistry.delete(workspaceId).catch(() => {});
       throw error;
     }
+    const ownership = ownershipOf(config);
     const live = ctx.sessions.get(created.sessionId);
     const seeded = seedFirstTurnEnabled(config) && live !== undefined;
     if (seeded && live !== undefined) seedFirstTurn(live);
@@ -297,6 +372,18 @@ export function apply(ctx, config) {
     // that materializes it, so it survives a restart and can be listed by another process.
     await ctx.sessionPersistence.flush();
     const stored = await ctx.sessionPersistence.stat(created.sessionId);
+    // 原生对象确认落盘后才收尾意图：`bare` 模式没有工作区登记，可交接的东西不存在，故不入账。
+    if (coordinator === undefined) {
+      // 无宿主上下文（夹具/模拟环境）：没有账本可写，保持 v0.1.1 的创建语义。
+    } else if (workspaceId !== undefined) {
+      const directory = await stat(cwd).catch(() => undefined);
+      const directoryIdentity = directory === undefined
+        ? null
+        : { dev: String(directory.dev), ino: String(directory.ino) };
+      await coordinator.finishCreate({ sessionId, cwd, canonicalCwd, workspaceId, directoryIdentity });
+    } else {
+      await coordinator.abortCreate({ sessionId }).catch(() => {});
+    }
     return {
       sessionId: created.sessionId,
       cwd,
@@ -393,6 +480,17 @@ export function apply(ctx, config) {
    */
   async function ensureSessionWorkspace(sessionId, cwd, preserveMissing = false) {
     if (ownershipOf(config) !== OWNERSHIP_WORKSPACE) return null;
+    // 资格闸门：只处理账本里确认由本插件托管的会话。用户停用期间收编的会话、普通工作区
+    // 会话和子代理会话都不会因为「路径长得像插件目录」而被重新建目录或补登记。
+    await lifecycleReady;
+    if (coordinator !== undefined) {
+      if ((await coordinator.ownsSession(sessionId)) === false) return null;
+      // 恢复/交接进行中，原生变更只能由协调器发起：这里只读现状，不抢跑 create/attach。
+      if (coordinator.state !== PROCESS_STATE.READY) {
+        const existing = workspaceOf(await resolveDirectory(cwd ?? sessionDirPath(sessionsRoot, sessionId)));
+        return existing?.id ?? null;
+      }
+    }
     // A native archived row still needs its workspace membership. An existing receipt may
     // legitimately point at a reclaimed empty cwd; keep that identity without recreating disk.
     const directory = await resolveDirectory(cwd ?? sessionDirPath(sessionsRoot, sessionId));
@@ -743,19 +841,10 @@ export function apply(ctx, config) {
           }
           continue;
         }
-        // Boot half of A6: the record cannot be deleted (no host API), so only the directory
-        // goes — and only for a session that owns its directory (name === id) and that no other
-        // session still shares. An inherited cwd belongs to the parent session.
-        if (linkName !== sessionId) continue;
-        if (sharedWithVisibleSession(snapshot.header.cwd, sessionId, durable, archived)) continue;
-        try {
-          if (await reclaimEmptyDir(directory)) {
-            await dropRoomLink({ root, target: linkTarget(linkName), keepName: true });
-            reports.push({ status: 'reclaimed', sessionId });
-          }
-        } catch (error) {
-          ctx.logger?.warn?.(`[chat-sessions] reclaim failed for ${sessionId}: ${messageOf(error)}`);
-        }
+        // 目录保留：生命周期交接要求「旧目录（含已归档的空目录）一律保留」，
+        // 所以这里不再回收任何 `session-<uuid>` 目录，也不拆它的标题软链接。
+        // 归档只是把入口挪进 `.archive/`，磁盘上的房间还在，重新启用后仍能原样挂回去。
+        reports.push({ status: 'retained', sessionId });
       }
       // Registry-level tidying runs whatever happened above: a stale receipt has no session
       // pointing at it, so the per-session loop above never sees it.
@@ -931,6 +1020,10 @@ export function apply(ctx, config) {
         workspaceId: null,
       });
     }
+    // 账本摘要只读一次，供前端判断「哪些房间归插件管」。账本不可用时给空集合，
+    // 让客户端退回纯原生视图，而不是拿路径猜测去压平用户工作区。
+    await lifecycleReady;
+    const lifecycle = coordinator === undefined ? null : await coordinator.describe();
     return {
       ok: true,
       root,
@@ -951,6 +1044,15 @@ export function apply(ctx, config) {
       durableSessions: durable.length,
       sessions,
       workspaces,
+      // 明确托管集合：前端只按这份清单压平/分簇，不再靠路径形状猜哪些房间是插件的。
+      // `workspaces` 保持全量，排序仍依赖原生 pinned/pinIndex/updatedAt。
+      ...(lifecycle === null
+        ? { lifecycle: { state: 'unavailable' }, managedWorkspaceIds: [], managedSessionIds: [] }
+        : {
+          lifecycle,
+          managedWorkspaceIds: lifecycle.managed.workspaceIds,
+          managedSessionIds: lifecycle.managed.sessionIds,
+        }),
     };
   }
 
@@ -970,9 +1072,15 @@ export function apply(ctx, config) {
       try {
         if (req.method === 'POST' && url.pathname === `${ROUTE_PREFIX}/create`) {
           const body = await readJsonBody(req);
-          const created = body.reuseBlank === true
-            ? await reuseOrCreateBlank()
-            : await createStandaloneSession();
+          // 交接/恢复期间一律拒绝新写（409 + 稳定码），不排队、不猜结果。
+          if (!(await lifecycleWritable())) {
+            answer(res, 409, { ok: false, error: 'LIFECYCLE_NOT_READY', code: 'LIFECYCLE_NOT_READY' });
+            return;
+          }
+          const work = body.reuseBlank === true
+            ? reuseOrCreateBlank()
+            : createStandaloneSession();
+          const created = await (coordinator === undefined ? work : coordinator.track(work));
           answer(res, 200, { ok: true, ...created });
           return;
         }
@@ -1184,7 +1292,13 @@ export function apply(ctx, config) {
         answer(res, 404, { ok: false, error: `no route for ${req.method} ${url.pathname}` });
       } catch (error) {
         ctx.logger?.warn?.(`[chat-sessions] ${req.method} ${url.pathname} failed: ${messageOf(error)}`);
-        answer(res, 500, { ok: false, error: messageOf(error) });
+        // 生命周期未就绪是预期状态（启动恢复/正在交接/账本坏掉），不是 500。
+        const notReady = error?.code === 'LIFECYCLE_NOT_READY';
+        answer(res, notReady ? 409 : 500, {
+          ok: false,
+          error: messageOf(error),
+          ...(notReady ? { code: 'LIFECYCLE_NOT_READY' } : {}),
+        });
       }
     },
   }));
