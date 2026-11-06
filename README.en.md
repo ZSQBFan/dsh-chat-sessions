@@ -65,7 +65,7 @@ A [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) plugin tha
 
 ## Requirements
 
-Requires DeepSeek Harness `>=0.2.0-rc.2 <0.3.0-0`; developed and tested against `0.2.1-rc.5`.
+Requires DeepSeek Harness `>=0.2.0-rc.2 <0.3.0-0`; developed and tested against `0.2.2-rc.1`.
 
 ## Installation
 
@@ -114,7 +114,7 @@ Node 22 or newer; CI uses Node 22. After `npm ci`:
 
 ## Compatibility and feedback
 
-Primarily used and validated on macOS with DSH 0.2.1-rc.5. Other platforms and versions remain unverified. The plugin depends on the native sidebar structure and may need adaptation after DSH updates.
+Primarily used and validated on macOS with DSH 0.2.2-rc.1. Other platforms and versions remain unverified. The plugin depends on the native sidebar structure and may need adaptation after DSH updates.
 
 This is a personally maintained project, updated as needs arise. Report problems through [Issues](https://github.com/ZSQBFan/dsh-chat-sessions/issues), including your DSH version, operating system, and reproduction steps. Remove private content from screenshots and logs first.
 
