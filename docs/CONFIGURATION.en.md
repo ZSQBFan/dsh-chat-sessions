@@ -43,6 +43,18 @@ These options exist for implementation experiments. Keep their defaults for ever
 | `ownership` | `workspace` / `bare` | `workspace` | `workspace` registers a native workspace for a new room, enabling the native composer. `bare` creates a session without workspace membership; the current host requires a workspace to enable the composer, making this mode unsuitable for everyday chats. Changing this setting does not migrate existing data or release rooms from management. |
 | `seedFirstTurn` | Boolean | `false` | Only an explicit `true` writes a closed empty first turn to newly created sessions; reused blanks are unaffected. This is known to conflict with native turn numbering and may cause `SessionFormatError: turn/start does not open the expected turn` on later reads. Keep it disabled. |
 
+## Lifecycle and ledger
+
+Handoff on disable, uninstall, and re-enable is automatic and has no configuration. Where it lives:
+
+- **Ledger**: `<DSH_HOME>/storages/dsh-chat-sessions-lifecycle/<scopeId>/ledger.json` (with `lock.json` beside it). It sits outside both the installed package and the room directories, and stores session ids, paths, phases, and error codes only — never conversation content.
+- **scope identity**: derived from the DSH data root, the active profile name, the plugin id, and the canonical `root`. A different profile, `DSH_HOME`, or `root` yields a different scope; nothing is migrated implicitly, and the old scope's ledger is left untouched.
+- **Single writer**: one plugin instance per scope. Without the lock the plugin degrades to read-only and reports `LOCK_HELD` instead of touching native registrations concurrently.
+- **Degraded state**: a corrupt ledger, a newer schema version, or a lock conflict stops automatic changes; `GET /chat-sessions/status` reports `lifecycle.state = DEGRADED` with empty `managedWorkspaceIds` / `managedSessionIds`.
+- **Directories**: no room directory is reclaimed from this version on, archived empty ones included. Delete them yourself in the filesystem if you want them gone.
+
+`/chat-sessions/status` also returns `managedWorkspaceIds` and `managedSessionIds`, so the client stops inferring ownership from path shape.
+
 ## Retired setting
 
 | Setting | Status | Behaviour |

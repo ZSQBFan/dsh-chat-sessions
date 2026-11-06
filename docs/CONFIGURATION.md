@@ -43,6 +43,18 @@ seedFirstTurn: false
 | `ownership` | `workspace` / `bare` | `workspace` | `workspace` 为新房间注册原生工作区，支持原生输入区。`bare` 创建没有工作区归属的会话；当前宿主依赖工作区来开放输入区，此模式不适合日常对话。切换此项不构成已有数据的迁移或退出管理操作。 |
 | `seedFirstTurn` | 布尔值 | `false` | 仅在显式设为 `true` 时，为新建会话写入一个空的首轮，不作用于复用的空白会话。已知会与原生首轮编号冲突，后续读取可能报 `SessionFormatError: turn/start does not open the expected turn`，请保持关闭。 |
 
+## 生命周期与账本
+
+停用、卸载、重新启用时的会话交接由插件自动完成，没有配置项。相关行为与位置：
+
+- **账本位置**：`<DSH_HOME>/storages/dsh-chat-sessions-lifecycle/<scopeId>/ledger.json`（同目录下还有 `lock.json`）。它位于安装包和房间目录之外，只记录会话 ID、路径、阶段与错误码，不记录对话内容。
+- **scope 身份**：由「DSH 数据根 + 当前 profile 名 + 插件标识 + 规范化后的 `root`」共同决定。换 profile、换 `DSH_HOME`、换 `root` 都会得到新的 scope，不会隐式迁移旧记录（切换后旧 scope 的账本原样保留）。
+- **单 writer 锁**：同一 scope 同时只允许一个插件实例写入；拿不到锁时插件进入只读降级并报 `LOCK_HELD`，不会并发改原生登记。
+- **降级状态**：账本损坏、schema 版本更高、锁冲突时，插件停止自动变更，`GET /chat-sessions/status` 的 `lifecycle.state` 为 `DEGRADED`，`managedWorkspaceIds` / `managedSessionIds` 返回空集合。
+- **目录**：本版起不再回收任何房间目录（含已归档空目录）。删目录请在文件系统里自己做。
+
+`/chat-sessions/status` 还额外返回 `managedWorkspaceIds` 与 `managedSessionIds`：前端据此判断哪些工作区属于插件，停止按路径形状推断归属。
+
 ## 已停用项
 
 | 配置项 | 状态 | 说明 |
