@@ -11,7 +11,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { fork } from 'node:child_process';
 import { once } from 'node:events';
-import { chmod, copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, unlink, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -406,6 +406,25 @@ test('5. scopeId 稳定、rootResolved:false 不误判迁移、跨 scope 账本�
   assert.ok(crossed.diagnostics[0].quarantinePath);
   assert.ok((await readFile(crossed.path)).equals(foreign));
   await assert.rejects(crossed.update((state) => state), (error) => error.code === 'LEDGER_INVALID');
+});
+
+test('5b. root symlink scope remains stable when the leaf appears after first open', async (t) => {
+  const workspace = await makeWorkspace(t);
+  const actualRoot = join(workspace.base, 'actual-root');
+  const aliasParent = join(workspace.base, 'alias-root');
+  await mkdir(actualRoot, {recursive: true});
+  await symlink(actualRoot, aliasParent, 'dir');
+  const configuredRoot = join(aliasParent, 'room');
+  const first = await openStore(workspace, {canonicalRoot: configuredRoot});
+  assert.equal(first.status, 'absent');
+  const firstPath = first.path;
+  await first.update((state) => { state.generation = 9; });
+  assert.equal((await first.read()).identity.rootResolved, false);
+  await mkdir(join(actualRoot, 'room'), {recursive: true});
+  const reopened = await openStore(workspace, {canonicalRoot: configuredRoot});
+  assert.equal(reopened.path, firstPath);
+  assert.equal(reopened.status, 'ready');
+  assert.equal((await reopened.read()).generation, 9);
 });
 
 test('6. classifyDirectory / classifyMember 分类表与房间计数', () => {

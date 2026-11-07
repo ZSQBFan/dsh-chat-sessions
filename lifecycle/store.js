@@ -27,7 +27,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { copyFile, mkdir, open, readFile, realpath, rename, unlink, writeFile } from 'node:fs/promises';
 import { homedir, hostname } from 'node:os';
-import { isAbsolute, join } from 'node:path';
+import { basename, dirname, isAbsolute, join } from 'node:path';
 
 import {
   DEFAULT_PLUGIN_ID,
@@ -175,6 +175,7 @@ export class LedgerStore {
     if (typeof canonicalRoot !== 'string' || canonicalRoot === '') throw new TypeError('LedgerStore.open 需要 canonicalRoot');
     const absoluteRoot = canonicalPath(canonicalRoot);
     if (!isAbsolute(absoluteRoot)) throw new TypeError('LedgerStore.open 的 canonicalRoot 必须是绝对路径');
+    const identityRoot = await canonicalPathWithMissingTail(absoluteRoot);
 
     let resolvedHome = effectiveDshHome(dshHome);
     try {
@@ -182,10 +183,9 @@ export class LedgerStore {
     } catch {
       // 数据根尚未建立：保留 resolve 结果，账本目录稍后一并创建。
     }
-    let resolvedRoot = absoluteRoot;
     let rootResolved = false;
     try {
-      resolvedRoot = canonicalPath(await realpath(absoluteRoot));
+      await realpath(absoluteRoot);
       rootResolved = true;
     } catch {
       rootResolved = false;
@@ -195,7 +195,7 @@ export class LedgerStore {
       pluginId: typeof pluginId === 'string' && pluginId !== '' ? pluginId : DEFAULT_PLUGIN_ID,
       profileId: typeof profileId === 'string' && profileId !== '' ? profileId : DEFAULT_PROFILE_ID,
       dshHome: resolvedHome,
-      canonicalRoot: resolvedRoot,
+      canonicalRoot: identityRoot,
       rootResolved,
     };
     const store = new LedgerStore({ identity, clock: now, leaseMs });
@@ -1052,6 +1052,23 @@ function commitOf(state) {
   return {revision: Number(state?.revision ?? 0), generation: Number(state?.generation ?? 0)};
 }
 
+
+/** Resolve existing ancestors while preserving a not-yet-created tail. */
+async function canonicalPathWithMissingTail(path) {
+  const tail = [];
+  let current = path;
+  while (true) {
+    try {
+      const resolved = await realpath(current);
+      return canonicalPath(join(resolved, ...tail.reverse()));
+    } catch {
+      const parent = dirname(current);
+      if (parent === current) return canonicalPath(path);
+      tail.push(basename(current));
+      current = parent;
+    }
+  }
+}
 
 function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');

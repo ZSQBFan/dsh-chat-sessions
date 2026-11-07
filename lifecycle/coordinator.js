@@ -462,11 +462,14 @@ export class LifecycleCoordinator {
       const canonical = typeof entry.canonicalCwd === 'string' && entry.canonicalCwd !== ''
         ? entry.canonicalCwd
         : canonicalPath(entry.cwd ?? '');
-      const room = registry.workspaces.find((workspace) =>
-        typeof workspace.path === 'string'
-        && canonicalPath(workspace.path) === canonical
-        && Array.isArray(workspace.sessionIds)
-        && workspace.sessionIds.includes(entry.sessionId));
+      let room;
+      for (const workspace of registry.workspaces) {
+        if (typeof workspace.path !== 'string' || !Array.isArray(workspace.sessionIds) || !workspace.sessionIds.includes(entry.sessionId)) continue;
+        if (await sameExistingPath(workspace.path, canonical)) {
+          room = workspace;
+          break;
+        }
+      }
       if (room !== undefined) {
         const stat = await statDirectory(entry.cwd);
         const members = [];
@@ -866,7 +869,10 @@ export class LifecycleCoordinator {
       // 同路径登记分三种：自己的（id 与账本一致）、别人的（用户新登记）、没有。
       // 只有「id 与账本一致」才能复用；用户自己登记的同路径工作区说明这个 cwd 已被收编，
       // 绝不能把旧会话挂进去（验收 F02 / R08 / R09）。
-      const samePath = registry.workspaces.filter((workspace) => workspace.path === room.cwd);
+      const samePath = [];
+      for (const workspace of registry.workspaces) {
+        if (typeof workspace.path === 'string' && await sameExistingPath(workspace.path, room.cwd)) samePath.push(workspace);
+      }
       const ours = samePath.find((workspace) => workspace.id === room.workspaceId);
       const foreignSamePath = samePath.filter((workspace) => workspace.id !== room.workspaceId);
       if (foreignSamePath.length > 0) {
@@ -890,7 +896,12 @@ export class LifecycleCoordinator {
         // 宿主对同一 canonical 路径会返回既有实体；返回值不属于我们刚建的那份就说明并发有人
         // 抢先登记了同一个 cwd，此时按用户收编处理，不 attach。
         const afterCreate = await readRegistry(this.#ctx);
-        const atPath = afterCreate.ok ? afterCreate.workspaces.filter((workspace) => workspace.path === room.cwd) : [];
+        const atPath = [];
+         if (afterCreate.ok) {
+           for (const workspace of afterCreate.workspaces) {
+             if (typeof workspace.path === 'string' && await sameExistingPath(workspace.path, room.cwd)) atPath.push(workspace);
+           }
+         }
         if (atPath.length > 1 || (atPath.length === 1 && atPath[0].id !== created.workspaceId)) {
           await this.#transitionRoom(room.workspaceId, ROOM_STATE.RELEASED, {
             error: {phase: 'restore', code: REASON.USER_CLAIMED, reason: REASON.USER_CLAIMED, at: new Date().toISOString()},
@@ -923,7 +934,7 @@ export class LifecycleCoordinator {
           const claim = latest.claimedBy.get(sessionId);
           if (claim !== undefined && claim !== '' && claim !== workspaceId) return false;
           const target = latest.workspaces.find((workspace) => workspace.id === workspaceId);
-          return target !== undefined && target.path === room.cwd;
+          return target !== undefined && await sameExistingPath(target.path, room.cwd);
         },
       });
       const failedIds = new Set(attached.failed.map((entry) => entry.sessionId));

@@ -660,6 +660,14 @@ export async function auditLegacyRooms(options = {}) {
         canonicalRoot: rootIdentity,
       })
     : null;
+  const rawScopeId = isNonEmptyString(scopeHome)
+    ? scopeIdentity({
+        pluginId: options.pluginId,
+        profileId: options.profileId,
+        dshHome: scopeHome,
+        canonicalRoot: root,
+      })
+    : null;
 
   // 归属判定：别名拼写（root）与真实拼写（rootIdentity）任一口径命中即算在 root 内。
   // 目录已不存在时只能靠字符串口径，两边都试才不会把 root 内的登记误判成 root 外。
@@ -744,7 +752,18 @@ export async function auditLegacyRooms(options = {}) {
       diagnostics.push({ code: LEGACY_DIAGNOSTIC.SCOPE_UNREADABLE, detail: String(error?.code ?? error) });
     }
   }
-  scopeState ??= await readScopeStateFromDisk({ dshHome: scopeHome, scopeId, diagnostics });
+  scopeState ??= await (async () => {
+    const ids = [...new Set([scopeId, rawScopeId].filter(isNonEmptyString))];
+    const states = await Promise.all(ids.map((id) => readScopeStateFromDisk({ dshHome: scopeHome, scopeId: id, diagnostics })));
+    return {
+      ledgerExists: states.some((state) => state.ledgerExists === true),
+      initialized: states.some((state) => state.initialized === true),
+      migrationCompleted: states.some((state) => state.migrationCompleted === true),
+      residue: states.some((state) => state.residue === true),
+      weakResidue: states.some((state) => state.weakResidue === true),
+      migrationSources: [...new Set(states.flatMap((state) => state.migrationSources))],
+    };
+  })();
 
   // ③ 链接索引（标题入口 / 归档入口）——只作佐证
   const links = await readLinksFile(root, diagnostics);
