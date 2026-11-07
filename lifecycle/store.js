@@ -8,10 +8,19 @@
  *     `quarantine/`（不覆盖、不删除），随后 `read()`／`update()` 抛
  *     `LEDGER_INVALID`，等待人工干预。
  *  2. 写路径只在 `<effectiveDSHHome>/storages/dsh-chat-sessions-lifecycle/<scopeId>/`
- *     内：临时文件同目录、`rename` 原子替换、尽力 fsync 父目录；失败时原文件不变。
+ *     内：临时文件同目录、`rename` 原子替换、fsync 父目录；失败时原文件不变。
  *  3. 锁只在「pid 不存活」或「租约过期」时回收；锁文件不可解析等不确定状态一律
- *     视为被持有，绝不删除别人的锁。
- *  4. 账本只记录 ID／路径／阶段／错误码／时间，绝不写入对话内容。
+ *     视为被持有，绝不删除别人的锁。长事务用心跳续租，提交前再做 token／revision
+ *     fencing：锁易主或基线 revision 变了就抛 `LOCK_LOST`／`REVISION_CONFLICT`，
+ *     绝不覆盖别人已提交的内容。
+ *  4. 首次安装完成后写独立的 `initialized.json` 标记（fsync + rename）。标记在、
+ *     账本却缺失或损坏 → `invalid`（诊断码 `LEDGER_MISSING_AFTER_INIT`），绝不
+ *     静默按首次安装重建 generation=1。只有「标记也没有」才是真正的首次安装。
+ *  5. 目录 fsync 的错误分开处理：平台不支持（EPERM／EINVAL／ENOTSUP／EBADF 等）
+ *     降级为已知限制 `limitations`；真实 I/O 故障（EIO／ENOSPC／EDQUOT 等）抛
+ *     `LEDGER_DURABILITY_UNKNOWN`——此时 rename 已发生、提交持久性不确定，
+ *     调用方应进入 DEGRADED 并对账。
+ *  6. 账本只记录 ID／路径／阶段／错误码／时间，绝不写入对话内容。
  *
  * 契约：docs/lifecycle/04-IMPLEMENTATION-CONTRACT.md §2、§4、§5。
  */
@@ -37,6 +46,32 @@ export { LedgerInvalidError };
 export const DEFAULT_LOCK_LEASE_MS = 30_000;
 /** 账本目录相对 `<effectiveDSHHome>` 的固定层级。 */
 const LEDGER_HOME_SEGMENTS = ['storages', 'dsh-chat-sessions-lifecycle'];
+/**
+ * 「本 scope 曾经完成过初始化」的独立标记文件名（与 ledger.json 分离）。
+ *
+ * 存在性即证据：内容损坏、scopeId 不匹配、无读权限都按「曾经初始化」处理，
+ * 宁可让 store 进 invalid 等人工干预，也不能把丢账本当首次安装重建。
+ */
+const INITIALIZATION_MARKER_FILE = 'initialized.json';
+const INITIALIZATION_MARKER_SCHEMA_VERSION = 1;
+/** 诊断码：标记在而账本缺失（等价于设计 §8.2 的「丢失 ≠ 新安装」）。 */
+export const LEDGER_MISSING_AFTER_INIT = 'LEDGER_MISSING_AFTER_INIT';
+/**
+ * 目录 fsync 的「平台不支持」错误码白名单。
+ *
+ * 命中的话 rename 语义仍然成立（同目录原子替换），只是无法再确认目录项落盘，
+ * 降级为已知限制；不在白名单里的一律当真实 I/O 故障上报（fail-safe）。
+ */
+const DIRECTORY_FSYNC_UNSUPPORTED_CODES = new Set([
+  'EPERM',
+  'EINVAL',
+  'ENOTSUP',
+  'EOPNOTSUPP',
+  'EBADF',
+  'EISDIR',
+  'EACCES',
+  'ENOSYS',
+]);
 
 /** 锁被其他存活 writer 持有（或无法判定时保守拒绝）。 */
 export class LockHeldError extends Error {
@@ -47,12 +82,30 @@ export class LockHeldError extends Error {
   }
 }
 
-/** 账本写入失败；调用方应假定磁盘内容未变。 */
+/** `LedgerWriteError.code` 的固定取值（契约 §5 之外新增的失败语义）。 */
+export const WRITE_ERROR_CODE = Object.freeze({
+  /** 写入没有发生，磁盘内容未变。 */
+  WRITE_FAILED: 'LEDGER_WRITE_FAILED',
+  /** 锁已易主或租约过期：本次事务不再持有写权限，未提交。 */
+  LOCK_LOST: 'LOCK_LOST',
+  /** 基线 revision 已被其他 writer 推进：拒绝覆盖，未提交。 */
+  REVISION_CONFLICT: 'REVISION_CONFLICT',
+  /** rename 已发生，但目录持久性无法确认：调用方应进 DEGRADED 并对账。 */
+  DURABILITY_UNKNOWN: 'LEDGER_DURABILITY_UNKNOWN',
+});
+
+/**
+ * 账本写入失败。
+ *
+ * `code` 默认 `LEDGER_WRITE_FAILED`（磁盘未变）；fencing 与持久性失败用
+ * `WRITE_ERROR_CODE` 里的其它值，`durabilityUnknown` 表示 rename 已发生。
+ */
 export class LedgerWriteError extends Error {
   constructor(message, options = {}) {
     super(message, options.cause === undefined ? undefined : { cause: options.cause });
     this.name = 'LedgerWriteError';
-    this.code = 'LEDGER_WRITE_FAILED';
+    this.code = typeof options.code === 'string' && options.code !== '' ? options.code : WRITE_ERROR_CODE.WRITE_FAILED;
+    this.durabilityUnknown = options.durabilityUnknown === true;
   }
 }
 
@@ -91,11 +144,15 @@ export class LedgerStore {
   #scopeId;
   #directory;
   #path;
+  #markerPath;
   #clock;
   #leaseMs;
   #status = 'absent';
   #state = null;
   #diagnostics = [];
+  #limitations = [];
+  #initializationMarker = 'absent';
+  #directoryFsync = 'unknown';
   #queue = Promise.resolve();
   #closed = false;
 
@@ -145,6 +202,7 @@ export class LedgerStore {
     this.#scopeId = scopeIdentity(identity);
     this.#directory = ledgerDirectory({ dshHome: identity.dshHome, scopeId: this.#scopeId });
     this.#path = join(this.#directory, 'ledger.json');
+    this.#markerPath = join(this.#directory, INITIALIZATION_MARKER_FILE);
     this.#clock = clock;
     this.#leaseMs = Number.isFinite(leaseMs) && leaseMs > 0 ? leaseMs : DEFAULT_LOCK_LEASE_MS;
   }
@@ -152,6 +210,11 @@ export class LedgerStore {
   /** `ledger.json` 的绝对路径。 */
   get path() {
     return this.#path;
+  }
+
+  /** 初始化标记 `initialized.json` 的绝对路径（与账本同目录、互相独立）。 */
+  get markerPath() {
+    return this.#markerPath;
   }
 
   /** `'ready' | 'invalid' | 'absent'`。 */
@@ -162,6 +225,21 @@ export class LedgerStore {
   /** 只读诊断副本；`invalid` 时至少一条。 */
   get diagnostics() {
     return this.#diagnostics.map((entry) => ({ ...entry }));
+  }
+
+  /**
+   * 已知平台限制（不是本次故障）；只读副本。
+   *
+   * 目前只会出现 `DIRECTORY_FSYNC_UNSUPPORTED`：该平台不允许 fsync 目录，
+   * rename 仍原子，但目录项落盘无法确认。
+   */
+  get limitations() {
+    return this.#limitations.map((entry) => ({ ...entry }));
+  }
+
+  /** 初始化标记的最近一次读取结果：`'present' | 'absent' | 'unreadable'`。 */
+  get initializationMarker() {
+    return this.#initializationMarker;
   }
 
   /**
@@ -229,6 +307,8 @@ export class LedgerStore {
       schemaVersion,
       roomCount,
       lockHeld: lockBlocks(lock, Date.now()),
+      initializationMarker: this.#initializationMarker,
+      directoryFsync: this.#directoryFsync,
     };
   }
 
@@ -251,19 +331,71 @@ export class LedgerStore {
       });
       return;
     }
+    await this.#loadFromDisk();
+  }
+
+  /**
+   * 从磁盘判定 ready／absent／invalid，`open()` 与每次 `update()` 共用。
+   *
+   * 关键区别：`ledger.json` 缺失只有在「初始化标记也不存在」时才算首次安装；
+   * 标记在而账本没了 → `LEDGER_MISSING_AFTER_INIT`，保持 invalid，绝不重建。
+   */
+  async #loadFromDisk() {
+    const marker = await this.#readInitializationMarker();
+    this.#initializationMarker = marker;
     let raw;
     try {
       raw = await readFile(this.#path);
     } catch (error) {
       if (error?.code === 'ENOENT') {
-        this.#status = 'absent';
+        this.#state = null;
+        if (marker === 'absent') {
+          this.#status = 'absent';
+          this.#diagnostics = [];
+          return;
+        }
+        this.#status = 'invalid';
+        this.#diagnostics = [{
+          code: LEDGER_MISSING_AFTER_INIT,
+          message: `账本缺失，但初始化标记${marker === 'unreadable' ? '无法读取（按已初始化处理）' : '仍然存在'}：`
+            + '不能当作首次安装重建 generation=1，需人工恢复或显式重建',
+          ...(marker === 'unreadable' ? {} : { markerPath: this.#markerPath }),
+        }];
         return;
       }
+      this.#state = null;
       this.#status = 'invalid';
-      this.#diagnostics.push({ code: REASON.LEDGER_INVALID, message: `无法读取账本: ${error.message}` });
+      this.#diagnostics = [{ code: REASON.LEDGER_INVALID, message: `无法读取账本: ${error.message}` }];
       return;
     }
     await this.#adopt(raw);
+    // 账本在、标记不在（老版本升级或标记被误删）：账本才是权威，补写标记。
+    if (this.#status === 'ready' && marker !== 'present') await this.#repairInitializationMarker();
+  }
+
+  /**
+   * 读初始化标记：只看「能不能读到」。
+   * @returns {Promise<'present'|'absent'|'unreadable'>}
+   */
+  async #readInitializationMarker() {
+    try {
+      await readFile(this.#markerPath);
+      return 'present';
+    } catch (error) {
+      return error?.code === 'ENOENT' ? 'absent' : 'unreadable';
+    }
+  }
+
+  /** 账本已在、标记缺失时补写；失败只记诊断，不否决已经可读的账本。 */
+  async #repairInitializationMarker() {
+    try {
+      await this.#writeInitializationMarker(this.#state);
+    } catch (error) {
+      this.#diagnostics.push({
+        code: REASON.LEDGER_WRITE_FAILED,
+        message: `初始化标记补写失败（账本本身可读）: ${error.message}`,
+      });
+    }
   }
 
   /** 校验一份磁盘内容；坏内容只隔离，不覆盖原件。 */
@@ -320,10 +452,12 @@ export class LedgerStore {
   async #updateExclusive(mutator) {
     if (this.#status === 'invalid') throw this.#invalidError();
     const token = await this.#acquireLock();
+    const heartbeat = this.#startLeaseHeartbeat(token);
     try {
       await this.#reload();
       if (this.#status === 'invalid') throw this.#invalidError();
-      const base = this.#status === 'absent' ? createLedger(this.#identity, { now: this.#now() }) : this.#state;
+      const firstInstall = this.#status === 'absent';
+      const base = firstInstall ? createLedger(this.#identity, { now: this.#now() }) : this.#state;
       const draft = structuredClone(base);
       const returned = await mutator(draft);
       const candidate = returned === undefined ? draft : returned;
@@ -339,37 +473,43 @@ export class LedgerStore {
       normalized.identity = { ...this.#identity };
       normalized.revision = base.revision + 1;
       normalized.updatedAt = new Date(this.#now()).toISOString();
-      await this.#writeAtomic(normalized);
+      // 心跳已经确认失锁（或续租失败）：不再尝试写入，避免覆盖接管者。
+      if (heartbeat.lost) throw this.#leaseLostError(heartbeat);
+      await this.#writeAtomic(normalized, {
+        token,
+        expectedRevision: base.revision,
+        baseAbsent: firstInstall,
+      });
+      // 首次安装：账本落盘后补写独立初始化标记；标记失败时账本已提交，
+      // 下次 open 会按「账本在、标记缺」补写，不会误判成丢账本。
+      if (firstInstall) await this.#writeInitializationMarker(normalized);
       this.#state = normalized;
       this.#status = 'ready';
       return { state: structuredClone(normalized), revision: normalized.revision };
     } finally {
+      this.#stopLeaseHeartbeat(heartbeat);
+      // 等在途续租落地，再释放锁：否则它可能在 unlink 之后把 lock.json 写回来。
+      await heartbeat.settled;
       await this.#releaseLock(token);
     }
   }
 
-  /** 在锁内重读磁盘，吸收其他 writer 已提交的 revision。 */
+  /** 在锁内重读磁盘，吸收其他 writer 已提交的 revision（并复核初始化标记）。 */
   async #reload() {
-    let raw;
-    try {
-      raw = await readFile(this.#path);
-    } catch (error) {
-      if (error?.code === 'ENOENT') {
-        this.#state = null;
-        this.#status = 'absent';
-        return;
-      }
-      this.#status = 'invalid';
-      this.#state = null;
-      this.#diagnostics = [{ code: REASON.LEDGER_INVALID, message: `无法读取账本: ${error.message}` }];
-      return;
-    }
-    await this.#adopt(raw);
+    await this.#loadFromDisk();
   }
 
   // ── 原子写 ────────────────────────────────────────────────────────────────
 
-  async #writeAtomic(state) {
+  /**
+   * 临时文件 → fsync → fencing → rename → 目录 fsync。
+   *
+   * fencing 放在 rename 之前：确认锁还是自己的、磁盘 revision 仍等于本次基线，
+   * 任何一条不成立就抛 `LOCK_LOST`／`REVISION_CONFLICT`，临时文件被清理。
+   * @param {object} state 已归一化的新账本。
+   * @param {{token: string, expectedRevision: number, baseAbsent: boolean}} fence
+   */
+  async #writeAtomic(state, fence) {
     const token = randomBytes(8).toString('hex');
     const temporary = join(this.#directory, `ledger.json.tmp-${token}`);
     const text = `${JSON.stringify(state, null, 2)}\n`;
@@ -380,6 +520,7 @@ export class LedgerStore {
       await handle.sync();
       await handle.close();
       handle = null;
+      await this.#fenceCommit(fence);
       await rename(temporary, this.#path);
     } catch (error) {
       if (handle !== null) await handle.close().catch(() => {});
@@ -391,16 +532,116 @@ export class LedgerStore {
     await this.#syncDirectory();
   }
 
-  async #syncDirectory() {
+  /**
+   * 提交前 fencing：token 仍是自己、租约未过期、磁盘 revision 仍等于本次基线。
+   *
+   * 三条都过只说明「此刻」仍独占；rename 与它之间仍有理论窗口（没有 OS 级
+   * 条件写原语），但任何已发生的接管都会在这里被拒绝，不会覆盖别人的提交。
+   */
+  async #fenceCommit({ token, expectedRevision, baseAbsent }) {
+    const lockPath = join(this.#directory, 'lock.json');
+    const lock = await readLockFile(lockPath);
+    if (lock === null || lock === 'unreadable' || typeof lock !== 'object' || Array.isArray(lock) || lock.token !== token) {
+      throw new LedgerWriteError('提交前发现锁已易主或消失，拒绝写入（本次事务未提交）', { code: WRITE_ERROR_CODE.LOCK_LOST });
+    }
+    const lease = typeof lock.leaseExpiresAt === 'string' ? Date.parse(lock.leaseExpiresAt) : Number.NaN;
+    if (!Number.isFinite(lease) || lease <= Date.now()) {
+      throw new LedgerWriteError('提交前租约已过期，无法确认独占写入权，拒绝写入（本次事务未提交）', { code: WRITE_ERROR_CODE.LOCK_LOST });
+    }
+    let raw;
+    try {
+      raw = await readFile(this.#path);
+    } catch (error) {
+      if (error?.code === 'ENOENT' && baseAbsent) return; // 首次安装：磁盘确实还没有账本
+      throw new LedgerWriteError(`提交前无法重读账本，拒绝写入: ${error.message}`, { cause: error });
+    }
+    if (baseAbsent) {
+      throw new LedgerWriteError('提交前发现账本已被其他 writer 建立，拒绝覆盖', { code: WRITE_ERROR_CODE.REVISION_CONFLICT });
+    }
+    let diskRevision;
+    try {
+      diskRevision = JSON.parse(raw.toString('utf8'))?.revision;
+    } catch {
+      diskRevision = undefined;
+    }
+    if (diskRevision !== expectedRevision) {
+      throw new LedgerWriteError(
+        `提交前 revision 已变化（磁盘 ${String(diskRevision)} != 本次基线 ${expectedRevision}），拒绝覆盖`,
+        { code: WRITE_ERROR_CODE.REVISION_CONFLICT },
+      );
+    }
+  }
+
+  /**
+   * fsync 父目录，让 rename 的目录项落盘。
+   *
+   * 平台不支持目录 fsync → 记一条已知限制后继续；其余错误 → 抛
+   * `LEDGER_DURABILITY_UNKNOWN`：rename 已经发生，old-or-new 内容都在，但无法
+   * 确认这次提交能挨过掉电／崩溃，调用方应进入 DEGRADED 并对账。
+   */
+  async #syncDirectory({ durabilityUnknownMessage = '账本目录 fsync 失败（rename 已发生，提交持久性不确定）' } = {}) {
     let handle = null;
     try {
       handle = await open(this.#directory, 'r');
       await handle.sync();
-    } catch {
-      // 部分平台不允许 fsync 目录；rename 已保证同目录原子替换，这里只尽力而为。
+      this.#directoryFsync = 'synced';
+    } catch (error) {
+      if (DIRECTORY_FSYNC_UNSUPPORTED_CODES.has(error?.code)) {
+        this.#directoryFsync = 'unsupported';
+        if (!this.#limitations.some((entry) => entry.code === 'DIRECTORY_FSYNC_UNSUPPORTED')) {
+          this.#limitations.push({
+            code: 'DIRECTORY_FSYNC_UNSUPPORTED',
+            message: `平台不允许 fsync 目录（${String(error?.code)}: ${error?.message ?? error}）；rename 仍原子，但目录项落盘无法确认`,
+          });
+        }
+        return;
+      }
+      this.#directoryFsync = 'unknown';
+      const detail = `${String(error?.code ?? 'UNKNOWN')}: ${error?.message ?? error}`;
+      this.#diagnostics.push({ code: WRITE_ERROR_CODE.DURABILITY_UNKNOWN, message: detail });
+      throw new LedgerWriteError(`${durabilityUnknownMessage}（${detail}）`, {
+        cause: error,
+        code: WRITE_ERROR_CODE.DURABILITY_UNKNOWN,
+        durabilityUnknown: true,
+      });
     } finally {
       if (handle !== null) await handle.close().catch(() => {});
     }
+  }
+
+  /**
+   * 写初始化标记：临时文件 → fsync → rename → 目录 fsync。
+   *
+   * 只在「账本已经成功落盘」之后调用（首次安装或补写），因此这里的失败意味着
+   * 账本已提交、标记可能缺失；错误信息会明确说出来，便于上层判断。
+   */
+  async #writeInitializationMarker(state) {
+    const payload = {
+      schemaVersion: INITIALIZATION_MARKER_SCHEMA_VERSION,
+      scopeId: this.#scopeId,
+      initializedAt: new Date().toISOString(),
+      firstRevision: Number.isSafeInteger(state?.revision) ? state.revision : null,
+      firstGeneration: Number.isSafeInteger(state?.generation) ? state.generation : null,
+    };
+    const temporary = join(this.#directory, `${INITIALIZATION_MARKER_FILE}.tmp-${randomBytes(8).toString('hex')}`);
+    let handle = null;
+    try {
+      handle = await open(temporary, 'wx', 0o600);
+      await handle.writeFile(`${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+      await handle.sync();
+      await handle.close();
+      handle = null;
+      await rename(temporary, this.#markerPath);
+    } catch (error) {
+      if (handle !== null) await handle.close().catch(() => {});
+      await unlink(temporary).catch(() => {});
+      throw new LedgerWriteError(
+        `初始化标记写入失败（账本已提交，标记缺失，下次 open 会补写）: ${error.message}`,
+        { cause: error },
+      );
+    }
+    await this.#syncDirectory({ durabilityUnknownMessage: '初始化标记已 rename，但目录持久性不确定' });
+    this.#initializationMarker = 'present';
   }
 
   // ── 单 writer 锁 ──────────────────────────────────────────────────────────
@@ -434,6 +675,101 @@ export class LedgerStore {
       }
     }
     throw new LockHeldError('回收过期锁后仍无法取得锁');
+  }
+
+  // ── 租约心跳与失锁判定 ────────────────────────────────────────────────────
+
+  /**
+   * 事务期间按租约 1/3 的节奏续租，避免长 mutator 被别的 writer 合法回收。
+   *
+   * 定时器 `unref()`：不得因为心跳把进程吊住。续租自身串成一条链（`settled`），
+   * 事务结束时先停表、再等这条链落地，最后才释放锁——否则在途续租可能在 unlink
+   * 之后把 lock.json 写回来，留下最长一个租约的假锁。
+   * @param {string} token 本次事务的锁 token。
+   * @returns {{token: string, timer: object|null, lost: boolean, error: Error|null, settled: Promise<void>}}
+   */
+  #startLeaseHeartbeat(token) {
+    const context = { token, timer: null, lost: false, error: null, settled: Promise.resolve() };
+    const interval = Math.max(10, Math.min(Math.floor(this.#leaseMs / 3), 10_000));
+    context.timer = setInterval(() => {
+      // #renewLease 自己吞掉所有异常并置 lost，这里只负责串行化。
+      context.settled = context.settled.then(() => this.#renewLease(context));
+    }, interval);
+    context.timer.unref?.();
+    return context;
+  }
+
+  #stopLeaseHeartbeat(context) {
+    if (context !== null && context !== undefined && context.timer !== null) {
+      clearInterval(context.timer);
+      context.timer = null;
+    }
+  }
+
+  /**
+   * 续租一次。
+   *
+   * 先读锁确认 token 仍是自己、租约还没过期，再用「临时文件 + rename」原子替换
+   * 锁文件（直接用 writeFile 截断会让并发读者看到半截 JSON）。租约已过期时绝不
+   * 写回——那等于「复活」一把可能已被别人回收的锁。
+   */
+  async #renewLease(context) {
+    if (context.lost) return;
+    try {
+      const lockPath = join(this.#directory, 'lock.json');
+      const current = await readLockFile(lockPath);
+      if (current === null || current === 'unreadable' || typeof current !== 'object' || Array.isArray(current) || current.token !== context.token) {
+        context.lost = true;
+        this.#stopLeaseHeartbeat(context);
+        return;
+      }
+      const now = Date.now();
+      const expiresAt = typeof current.leaseExpiresAt === 'string' ? Date.parse(current.leaseExpiresAt) : Number.NaN;
+      if (!Number.isFinite(expiresAt) || expiresAt <= now) {
+        context.lost = true;
+        this.#stopLeaseHeartbeat(context);
+        return;
+      }
+      const payload = {
+        ...current,
+        leaseExpiresAt: new Date(now + this.#leaseMs).toISOString(),
+        renewedAt: new Date(now).toISOString(),
+      };
+      await this.#writeLockAtomic(lockPath, payload);
+    } catch (error) {
+      // 续租失败等于「无法证明仍独占」：停表让提交被 fencing 拒绝。
+      context.lost = true;
+      context.error = error;
+      this.#stopLeaseHeartbeat(context);
+    }
+  }
+
+  /** 原子替换锁文件（同目录临时文件 → rename）。 */
+  async #writeLockAtomic(lockPath, payload) {
+    const temporary = `${lockPath}.tmp-${randomBytes(4).toString('hex')}`;
+    try {
+      const handle = await open(temporary, 'wx', 0o600);
+      try {
+        await handle.writeFile(`${JSON.stringify(payload, null, 2)}\n`, 'utf8');
+        await handle.sync();
+      } finally {
+        await handle.close().catch(() => {});
+      }
+      await rename(temporary, lockPath);
+    } catch (error) {
+      await unlink(temporary).catch(() => {});
+      throw error;
+    }
+  }
+
+  /** 心跳发现失锁时的统一错误：本次事务未提交，磁盘内容归接管者所有。 */
+  #leaseLostError(heartbeat) {
+    const cause = heartbeat.error ?? undefined;
+    const detail = cause === undefined ? '锁已易主或租约已过期' : `续租失败: ${cause.message}`;
+    return new LedgerWriteError(`本事务已失去写锁（${detail}），拒绝提交`, {
+      ...(cause === undefined ? {} : { cause }),
+      code: WRITE_ERROR_CODE.LOCK_LOST,
+    });
   }
 
   async #reclaimLock(lockPath) {

@@ -1,16 +1,20 @@
 /**
- * L1 测试：生命周期账本存储（契约 §8 的 8 项）。
+ * L1 测试：生命周期账本存储（契约 §8 的 8 项 + REVIEW-20261107 的 F05／F06／F08 回归）。
  *
  * 全部测试使用真实临时目录（mkdtemp），不 mock fs；每项都对应契约里一条可观察
- * 行为，实现被改坏时必须变红。
+ * 行为，实现被改坏时必须变红。F05 与 F08 需要故障注入：前者用真子进程 + 同步阻塞
+ * 事件循环让租约过期，后者只在目录 FileHandle 上注入 sync 错误。
  *
  * 运行：node --test check-lifecycle-store.mjs
  */
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, copyFile, mkdir, mkdtemp, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { fork } from 'node:child_process';
+import { once } from 'node:events';
+import { chmod, copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   ELIGIBILITY,
@@ -28,6 +32,59 @@ import { LedgerStore, LedgerWriteError, LockHeldError, ledgerDirectory } from '.
 
 const NOW = Date.UTC(2026, 10, 7, 0, 0, 0);
 const LEDGER_SEGMENTS = ['storages', 'dsh-chat-sessions-lifecycle'];
+const LEASE_WORKER_FLAG = '--lifecycle-lease-worker';
+/** 持久化契约里的字面量：测试直接钉字符串，避免「常量改了测试跟着改」。 */
+const MARKER_FILE = 'initialized.json';
+const CODE_LOCK_LOST = 'LOCK_LOST';
+const CODE_REVISION_CONFLICT = 'REVISION_CONFLICT';
+const CODE_DURABILITY_UNKNOWN = 'LEDGER_DURABILITY_UNKNOWN';
+const CODE_MISSING_AFTER_INIT = 'LEDGER_MISSING_AFTER_INIT';
+
+// ── 子进程 worker（F05）：必须在注册测试之前分流 ─────────────────────────────
+//
+// `fork` 用同一个文件跑 worker；顶层 await 会挂住模块求值，所以下面的 test()
+// 注册不会在 worker 里执行。
+if (process.argv[2] === LEASE_WORKER_FLAG) {
+  await runLeaseWorker(JSON.parse(process.argv[3]));
+  process.exit(0);
+}
+
+function delay(ms) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+/** 同步阻塞事件循环：心跳定时器完全停摆，租约必然过期（模拟活 writer 被挂起）。 */
+function blockEventLoop(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+async function sendToParent(message) {
+  await new Promise((resolve, reject) => {
+    process.send(message, (error) => (error ? reject(error) : resolve()));
+  });
+}
+
+/**
+ * F05 的旧 writer：持锁进入 mutator → 通知父进程 → 同步挂起超过租约 → 再提交。
+ * 旧实现会直接覆盖接管者的提交；正确实现必须在提交前被 fencing 拒绝。
+ */
+async function runLeaseWorker(options) {
+  const store = await LedgerStore.open(options);
+  let report;
+  try {
+    await store.update(async (state) => {
+      await sendToParent({ phase: 'locked' });
+      blockEventLoop(options.blockMs);
+      state.generation = 999; // 一旦落盘就是「旧事务覆盖新提交」
+    });
+    report = { phase: 'committed' };
+  } catch (error) {
+    report = { phase: 'rejected', code: error?.code ?? null, message: String(error?.message ?? error) };
+  }
+  await sendToParent(report);
+}
 
 /** 每个测试一个隔离的工作区：dshHome 与 canonicalRoot 都是真实目录。 */
 async function makeWorkspace(t) {
@@ -476,4 +533,233 @@ test('8. 越界写检查：store 的所有文件都在自己的账本目录内',
   assert.throws(() => ledgerDirectory({ dshHome: workspace.dshHome, scopeId: '../escape' }), TypeError);
   assert.throws(() => ledgerDirectory({ dshHome: 'relative/home', scopeId: 'a'.repeat(32) }), TypeError);
   assert.equal(ledgerDirectory({ dshHome: workspace.dshHome, scopeId: 'a'.repeat(32) }), join(workspace.dshHome, ...LEDGER_SEGMENTS, 'a'.repeat(32)));
+});
+
+// ── REVIEW-20261107 回归：F05／F06／F08 ─────────────────────────────────────
+
+/** 目录 FileHandle.sync 故障注入：只影响目录句柄，普通文件仍走真实实现。 */
+async function withDirectorySyncFault(workspace, code, run) {
+  const probe = await open(join(workspace.base, `sync-probe-${code}`), 'w');
+  const prototype = Object.getPrototypeOf(probe);
+  const original = prototype.sync;
+  const counter = { injected: 0 };
+  prototype.sync = async function patchedSync() {
+    const info = await this.stat();
+    if (info.isDirectory()) {
+      counter.injected += 1;
+      throw Object.assign(new Error(`injected directory fsync ${code}`), { code });
+    }
+    return original.call(this);
+  };
+  try {
+    return { outcome: await run(), counter };
+  } finally {
+    prototype.sync = original;
+    await probe.close().catch(() => {});
+  }
+}
+
+test('9. F05 活 writer 租约过期后不得覆盖接管者的提交（心跳 + token/revision fencing）', async (t) => {
+  const workspace = await makeWorkspace(t);
+  const leaseMs = 120;
+  const store = await openStore(workspace, { leaseMs });
+  assert.equal((await store.update((state) => {
+    state.generation = 0;
+  })).revision, 1);
+
+  // A：真子进程，mutator 里同步挂起 900ms，心跳停摆 → 租约必然过期。
+  const child = fork(fileURLToPath(import.meta.url), [
+    LEASE_WORKER_FLAG,
+    JSON.stringify({
+      dshHome: workspace.dshHome,
+      canonicalRoot: workspace.canonicalRoot,
+      pluginId: 'chat-sessions',
+      profileId: 'profile-a',
+      leaseMs,
+      blockMs: 900,
+    }),
+  ], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
+  t.after(() => {
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+  });
+
+  const [locked] = await once(child, 'message');
+  assert.equal(locked.phase, 'locked', 'worker 必须先在持锁状态下进入 mutator');
+  // 立刻挂上第二个监听：worker 恢复后的报告绝不能因为父进程还在 await 而丢失。
+  const reportPromise = once(child, 'message');
+
+  // B：租约过期后合法接管（旧实现会在这里抢到锁），提交 generation=10。
+  await delay(leaseMs * 3);
+  const b = await openStore(workspace, { leaseMs });
+  const bWrite = await b.update((state) => {
+    state.generation += 10;
+  });
+  assert.equal(bWrite.revision, 2);
+  assert.equal(bWrite.state.generation, 10);
+
+  // A 恢复：提交前 fencing 必须拒绝，而不是把 999 写上去。
+  const [report] = await reportPromise;
+  await once(child, 'exit');
+  assert.equal(report.phase, 'rejected', '旧事务不得提交成功');
+  assert.equal(report.code, CODE_LOCK_LOST);
+
+  const disk = JSON.parse(await readFile(store.path, 'utf8'));
+  assert.equal(disk.generation, 10, '被接管后旧 writer 的草稿绝不能落盘');
+  assert.equal(disk.revision, 2);
+
+  // 恢复后的实例仍基于磁盘 revision 正常写入。
+  const resumed = await store.update((state) => {
+    state.generation += 1;
+  });
+  assert.equal(resumed.revision, 3);
+  assert.equal(resumed.state.generation, 11);
+
+  // 反向证据：正常长事务由心跳续租，别的实例拿不到锁（活 writer 不会被抢锁）。
+  const holding = store.update(async (state) => {
+    await delay(leaseMs * 6);
+    state.generation += 1;
+  });
+  await delay(leaseMs * 2);
+  const rival = await openStore(workspace, { leaseMs });
+  await assert.rejects(
+    rival.update((state) => {
+      state.generation = -1;
+    }),
+    (error) => error instanceof LockHeldError && error.code === 'LOCK_HELD',
+  );
+  const held = await holding;
+  assert.equal(held.revision, 4);
+  assert.equal(held.state.generation, 12);
+
+  // revision fencing 的另一半：锁仍是自己的，但磁盘 revision 已被推进 → 拒绝覆盖。
+  await assert.rejects(
+    store.update(async (state) => {
+      state.generation = 42;
+      // 模拟「别的进程写过账本但锁还在本事务手里」：只推进 revision。
+      const file = JSON.parse(await readFile(store.path, 'utf8'));
+      file.revision += 5;
+      await writeFile(store.path, `${JSON.stringify(file, null, 2)}\n`, 'utf8');
+    }),
+    (error) => error instanceof LedgerWriteError && error.code === CODE_REVISION_CONFLICT,
+  );
+  const conflicted = JSON.parse(await readFile(store.path, 'utf8'));
+  assert.equal(conflicted.generation, 12, '基线不一致时不得写入任何字段');
+  assert.equal(conflicted.revision, 9);
+  const afterConflict = await store.update((state) => {
+    state.generation = 13;
+  });
+  assert.equal(afterConflict.revision, 10, '拒绝覆盖后仍以磁盘 revision 为基线继续');
+});
+
+test('10. F06 已初始化账本丢失不得静默重建（独立标记 + LEDGER_MISSING_AFTER_INIT）', async (t) => {
+  const workspace = await makeWorkspace(t);
+  const store = await openStore(workspace);
+  await store.update((state) => {
+    state.migration.completed = true;
+    state.generation = 77;
+  });
+
+  // 标记与账本分离、同目录、且首次安装后已落盘。
+  const markerPath = join(dirname(store.path), MARKER_FILE);
+  assert.notEqual(markerPath, store.path);
+  const marker = JSON.parse(await readFile(markerPath, 'utf8'));
+  assert.equal(store.markerPath, markerPath);
+  assert.equal(marker.scopeId, store.path.split(sep).at(-2));
+  assert.equal(marker.firstRevision, 1);
+  assert.equal(store.initializationMarker, 'present');
+
+  // 模拟账本丢失：同一实例的下一次 update 必须失败，且不生成新账本。
+  const preserved = join(dirname(store.path), 'ledger.preserved.json');
+  await rename(store.path, preserved);
+  await assert.rejects(
+    store.update((state) => {
+      state.generation += 1;
+    }),
+    (error) => error instanceof LedgerInvalidError && error.code === 'LEDGER_INVALID',
+  );
+  assert.equal(store.status, 'invalid');
+  assert.equal(store.diagnostics.some((entry) => entry.code === CODE_MISSING_AFTER_INIT), true);
+  const afterLoss = await readdir(dirname(store.path));
+  assert.equal(afterLoss.includes('ledger.json'), false, '不得新建 generation=1 的账本');
+  assert.equal(afterLoss.some((name) => name.startsWith('ledger.json.tmp-')), false, '失败后不得留下临时文件');
+  assert.equal(afterLoss.includes('lock.json'), false, '失败后不得留下活动锁');
+
+  // 重开实例同样判 invalid，读接口也拒绝。
+  const reopened = await openStore(workspace);
+  assert.equal(reopened.status, 'invalid');
+  assert.equal(reopened.diagnostics[0].code, CODE_MISSING_AFTER_INIT);
+  await assert.rejects(reopened.read(), (error) => error instanceof LedgerInvalidError);
+  assert.equal((await readdir(dirname(store.path))).includes('ledger.json'), false);
+
+  // 人工恢复原账本后回到 ready，之前的状态（generation=77）完好。
+  await rename(preserved, store.path);
+  const restored = await openStore(workspace);
+  assert.equal(restored.status, 'ready');
+  assert.equal((await restored.read()).generation, 77);
+  assert.equal((await restored.read()).migration.completed, true);
+
+  // 账本才是权威：只删标记不影响可读性，open 会补写标记。
+  await rm(markerPath);
+  const repaired = await openStore(workspace);
+  assert.equal(repaired.status, 'ready');
+  assert.equal(repaired.initializationMarker, 'present');
+  assert.equal(JSON.parse(await readFile(markerPath, 'utf8')).scopeId, store.path.split(sep).at(-2));
+
+  // 真正首次安装（另一个 profile／scope）仍能正常建立账本与标记。
+  const fresh = await openStore(workspace, { profileId: 'profile-fresh' });
+  assert.equal(fresh.status, 'absent');
+  assert.notEqual(fresh.path, store.path);
+  const created = await fresh.update((state) => {
+    state.generation = 1;
+  });
+  assert.equal(created.revision, 1);
+  assert.equal(fresh.initializationMarker, 'present');
+  assert.equal(JSON.parse(await readFile(join(dirname(fresh.path), MARKER_FILE), 'utf8')).firstGeneration, 1);
+});
+
+test('11. F08 目录 fsync：平台不支持降级为已知限制，真实 I/O 故障报 LEDGER_DURABILITY_UNKNOWN', async (t) => {
+  const workspace = await makeWorkspace(t);
+  const store = await openStore(workspace);
+  await store.update((state) => {
+    state.generation = 1;
+  });
+
+  // (a) EINVAL：平台不允许 fsync 目录 → 降级为已知限制，写入照常成功。
+  const unsupported = await withDirectorySyncFault(workspace, 'EINVAL', () => store.update((state) => {
+    state.generation = 2;
+  }));
+  assert.equal(unsupported.counter.injected >= 1, true, '注入必须真的命中目录 sync');
+  assert.equal(unsupported.outcome.revision, 2);
+  assert.equal(unsupported.outcome.state.generation, 2);
+  assert.deepEqual((store.limitations ?? []).map((entry) => entry.code), ['DIRECTORY_FSYNC_UNSUPPORTED']);
+
+  // (b) EIO：真实 I/O 故障 → rename 已发生，必须报持久性不确定。
+  const failed = await withDirectorySyncFault(workspace, 'EIO', async () => {
+    try {
+      const result = await store.update((state) => {
+        state.generation = 3;
+      });
+      return { resolved: true, result };
+    } catch (error) {
+      return { resolved: false, error };
+    }
+  });
+  assert.equal(failed.counter.injected >= 1, true);
+  assert.equal(failed.outcome.resolved, false, '真实 I/O 故障不得被吞掉');
+  const error = failed.outcome.error;
+  assert.equal(error instanceof LedgerWriteError, true);
+  assert.equal(error.code, CODE_DURABILITY_UNKNOWN);
+  assert.equal(error.durabilityUnknown, true);
+  assert.match(error.message, /rename/);
+  assert.equal(store.diagnostics.some((entry) => entry.code === CODE_DURABILITY_UNKNOWN), true);
+  // rename 已经发生：磁盘上就是这次提交，revision 继续单调。
+  const disk = JSON.parse(await readFile(store.path, 'utf8'));
+  assert.equal(disk.generation, 3);
+  assert.equal(disk.revision, 3);
+  const next = await store.update((state) => {
+    state.generation = 4;
+  });
+  assert.equal(next.revision, 4, '持久性告警之后仍能基于磁盘 revision 继续');
+  assert.equal(next.state.generation, 4);
+  assert.equal(JSON.parse(await readFile(store.path, 'utf8')).generation, 4);
 });
