@@ -24,6 +24,19 @@
 - 新增：首次升级的多证据迁移接入启动流程。无账本时按「registry + 真实目录 + 会话 header」认领可确认的旧房间，证据不足只计数不猜；写 `migration.completed` 避免每次启动重扫。
 - 新增：`test-support/native-lifecycle-harness.mjs` 覆盖同目录派生会话、`LC_NATIVE_REMOVE=1` 时的原生 bundle 卸载交接。
 
+### 第二轮独立复审修复（2026-11-07/08）
+
+- 修复：提交在 `fence` 之后、`rename` 之前被挂起，租约过期后新 writer 提交，旧 writer 恢复仍覆盖（`generation` 10 → 1）。提交后追加 `history.jsonl` 再复验锁归属；锁已易主就按历史回写并抛 `LOCK_LOST`。
+- 修复：恢复意图写不进账本仍继续创建原生工作区。现在直接 `DEGRADED`，不产生原生副作用。
+- 修复：首次迁移写失败后启动流程又把 `DEGRADED` 覆盖成 `READY`。迁移失败向上抛 `blocked`，启动即失败。
+- 修复：收尾写账本失败留下的原生对象重启后不对账。启动按原生 registry 把已建成的意图补成房间（`ADOPTED`），停用后不再遗留工作区。
+- 修复：已排队的维护任务在停用完成后仍写标题软链接，`DEGRADED` 时也照写。`sweep` 按 `generation` 与 `canWrite()` 逐会话闸门，`/link` 与定时扫描都进 `coordinator.track`。
+- 修复：删除登记前的最后确认里看到的新同 `cwd` 成员没入账就删登记。现在先补进 `sessionIds`/`members`，写失败则不删登记。
+- 修复：同 `cwd` 的子代理成员被当派生成员补账并恢复。新增 `isSubagentHeader()`，派生与外来判定都跳过子代理。
+- 修复：`PARTIAL` 房间不再进入恢复候选，故障解除后也不重试。现在进入候选，只补缺失成员。
+- 修复：旧数据审计不识别 `initialized.json`，会把「账本丢失」报成 `adoptable`。审计现在输出 `initialized` / `INITIALIZED_WITHOUT_LEDGER`。
+- 测试：新增 `check-lifecycle-review2.mjs`（6 项，协调器级注入失败），`npm test` 133 项。
+
 ## 0.1.1 — 2026-11-06
 
 - 修复：空白独立会话等待约 90 秒后被误归档、当前编辑器退回工作区选择的问题。维护不再按日志闲置时间自动归档，保护未发送草稿及插件重新激活时的待续会话；保留标题链接同步和已归档空目录回收。

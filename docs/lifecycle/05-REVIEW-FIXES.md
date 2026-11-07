@@ -31,6 +31,22 @@ R01–R18 全部保留。复审没有推翻任何一条，只暴露了实现与�
 | K03 空白 hero | 文档限定：只有「无历史 hero」需要先选工作区 |
 | K04 读失败仍 READY | `start()` 里 `restore.blocked` → `DEGRADED` |
 
+## 三之二、第二轮复审（REVIEW2）缺陷与落点
+
+| 缺陷 | 落点 |
+| --- | --- |
+| R2-F01 fence 之后仍被覆盖 | `store.js#writeAtomic` 提交后追加 `history.jsonl` 并复验锁；`#reconcileWithHistory` 补「提交后崩溃」 |
+| R2-F02 恢复意图写失败仍继续 | `#restore` 的 RESTORING 用 `#updateRequired`，失败 `degrade()` + `blocked`，不建原生对象 |
+| R2-F03 迁移失败被覆盖成 READY | `#migrateLegacy` 返回 `{blocked}`，`start()` 直接失败 |
+| R2-F04 收尾失败不对账 | `#reconcileCreationIntents` 按原生 registry 把已成事意图补成房间并标 `ADOPTED` |
+| R2-F05 停用后旧维护仍写 | `index.js#sweep` 按 `generation`/`canWrite()` 逐会话闸门；`/link` 与定时扫描进 `coordinator.track` |
+| R2-F06 迟到成员未入账 | detach 的最后确认之后 `lateDerived` 先补账；写失败不删登记 |
+| R2-F07 子代理被补账 | `model.js#isSubagentHeader`，`#foreignMembers` / `#derivedMembers` 跳过 |
+| R2-F08 PARTIAL 不重试 | 恢复候选加入 `PARTIAL`，只补缺失成员 |
+| R2-F09 审计不认凭据 | `legacy.js` 读 `initialized.json`，报 `INITIALIZED_WITHOUT_LEDGER` |
+
+口径补充两条：①「房间即目录」——同 `canonicalCwd` 的派生会话默认算本房间成员，子代理除外；②`PARTIAL` 只表示「部分成员没挂上」，不是冲突，下一次启动会继续补。
+
 ## 四、仍然缺的宿主能力
 
 `workspaceRegistry` 没有条件删除/条件挂载（无 CAS、无 revision 参数），`mutate(fn)` 只在本进程写链内串行。插件侧把判定收拢在 `host-adapter.js`，接口一到即可替换，不需要改协调器状态机。
