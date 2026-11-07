@@ -240,6 +240,23 @@ export function classifyDirectory(room, stat) {
  *          room?: object|null, canonicalCwd?: string|null, workspaceId?: string|null}} [options]
  * @returns {'eligible'|'user-owned'|'missing-session'|'conflict'}
  */
+/**
+ * 会话 header 是否属于原生子代理。
+ *
+ * 形状与 legacy 审计保持一致：显式 origin/source 标记、委派深度、或带 parentSession 都算。
+ * 子代理与宿主会话可以共享同一个 cwd，但它不归插件托管（R14），既不能补账也不能恢复。
+ * @param {object|null|undefined} header
+ * @returns {boolean}
+ */
+export function isSubagentHeader(header) {
+  if (header === null || header === undefined || typeof header !== 'object') return false;
+  if (header.subagent === true) return true;
+  if (header.origin === 'subagent' || header.source === 'subagent') return true;
+  const depth = Number(header.delegationDepth);
+  if (Number.isFinite(depth) && depth > 0) return true;
+  return typeof header.parentSession === 'string' && header.parentSession !== '';
+}
+
 export function classifyMember(options = {}) {
   const { member = {}, header = null, claimedBy = null, isSubagent = false, room = null } = options;
   if (header === null || header === undefined) return ELIGIBILITY.MISSING_SESSION;

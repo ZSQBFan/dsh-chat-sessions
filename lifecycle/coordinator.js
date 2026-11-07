@@ -25,6 +25,7 @@ import {
   classifyDirectory,
   classifyMember,
   createLedger,
+  isSubagentHeader,
   roomTransition,
   summarizeRooms,
 } from './model.js';
@@ -229,6 +230,10 @@ export class LifecycleCoordinator {
     this.#lastDetach = ledger?.process?.lastDetach ?? null;
 
     const migration = await this.#migrateLegacy(ledger);
+    if (migration.blocked !== undefined) {
+      // 迁移失败时状态已经是 DEGRADED，不能再被后面的 READY 写入覆盖。
+      return {ok: false, blocked: migration.blocked};
+    }
     const reconcile = await this.#reconcileCreationIntents(ledger);
     const restore = await this.#restore(ledger);
     const summary = {...migration, ...reconcile, ...restore, rooms: summarizeRooms(ledger?.rooms ?? [])};
@@ -393,28 +398,97 @@ export class LifecycleCoordinator {
       state.migration = {version: 1, completed: true, at: new Date(this.#clock()).toISOString(), evidence};
     });
     if (result.ok === false) {
+      // 迁移没落盘就不能让启动流程继续走到 READY：旧房间还没有可靠的管理依据（复审 R2-F03）。
       this.degrade(result.code ?? REASON.LEDGER_WRITE_FAILED, 'legacy migration could not be persisted');
-      return {};
+      return {blocked: result.code ?? REASON.LEDGER_WRITE_FAILED};
     }
     if (drafts.length > 0) this.#log({event: 'legacy-migrated', ...evidence});
     return {legacy: evidence};
   }
 
-  /** 启动对账：超过 10 分钟仍是 PENDING 的意图判为 ABANDONED（不猜结果、不重启创建）。 */
+  /**
+   * 启动对账：PENDING 意图必须先看原生事实，再决定收敛方式（复审 R2-F04）。
+   *
+   * 「原生对象已建成、只是收尾没落盘」是现实中间态：把已经存在的房间补进账本，
+   * 否则插件对该 Workspace 一无所知，停用时也无法解除登记（R01/R10/R17）。
+   * - 登记里有这个 cwd 且成员含该会话 → 补成 MANAGED 房间，意图 ADOPTED；
+   * - 只有会话、没有登记 → 意图 ABANDONED（未分组会话本来就不需要交接）；
+   * - 什么都没有且已过 10 分钟 → ABANDONED；其余保持 PENDING 等下一次启动。
+   */
   async #reconcileCreationIntents(ledger) {
     const intents = Array.isArray(ledger?.creationIntents) ? ledger.creationIntents : [];
-    if (intents.length === 0) return {intentsAbandoned: 0};
+    if (intents.length === 0) return {intentsAbandoned: 0, intentsAdopted: 0};
+    const registry = await readRegistry(this.#ctx);
+    if (registry.ok === false) {
+      // 读不到原生登记就无法判断「对象是否已建成」，不能猜：直接停写。
+      this.degrade(REASON.LEDGER_WRITE_FAILED, 'creation intents could not be reconciled: registry unreadable');
+      return {blocked: REASON.LEDGER_WRITE_FAILED};
+    }
     const now = this.#clock();
-    const stale = intents.filter((entry) => {
-      const at = Date.parse(entry.createdAt ?? '');
-      return Number.isFinite(at) && now - at > 10 * 60 * 1000;
+    const adopted = [];
+    const abandoned = [];
+    for (const entry of intents) {
+      if (entry.state !== 'PENDING') continue;
+      const canonical = typeof entry.canonicalCwd === 'string' && entry.canonicalCwd !== ''
+        ? entry.canonicalCwd
+        : canonicalPath(entry.cwd ?? '');
+      const room = registry.workspaces.find((workspace) =>
+        typeof workspace.path === 'string'
+        && canonicalPath(workspace.path) === canonical
+        && Array.isArray(workspace.sessionIds)
+        && workspace.sessionIds.includes(entry.sessionId));
+      if (room !== undefined) {
+        const stat = await statDirectory(entry.cwd);
+        adopted.push({
+          entry,
+          workspaceId: room.id,
+          directoryIdentity: directoryIdentityOf(stat),
+          members: room.sessionIds.map((sessionId) => ({
+            sessionId,
+            eligibility: sessionId === entry.sessionId ? ELIGIBILITY.ATTACHED : ELIGIBILITY.ELIGIBLE,
+          })),
+        });
+        continue;
+      }
+      const header = await readSessionHeader(this.#ctx, entry.sessionId);
+      const sessionCwd = headerCwd(header);
+      const sessionExists = typeof sessionCwd === 'string' && sessionCwd !== '';
+      const at = Date.parse(entry.createdAt ?? entry.at ?? '');
+      if (sessionExists || (Number.isFinite(at) && now - at > 10 * 60 * 1000)) abandoned.push(entry);
+    }
+    if (adopted.length === 0 && abandoned.length === 0) return {intentsAbandoned: 0, intentsAdopted: 0};
+
+    const adoptedIds = new Set(adopted.map((item) => item.entry.id));
+    const abandonedIds = new Set(abandoned.map((entry) => entry.id));
+    const written = await this.#updateRequired((state) => {
+      state.rooms = Array.isArray(state.rooms) ? state.rooms : [];
+      const known = new Set(state.rooms.map((room) => room.workspaceId));
+      for (const item of adopted) {
+        if (known.has(item.workspaceId)) continue;
+        const room = roomRecord({
+          ownerSessionId: item.entry.sessionId,
+          cwd: item.entry.cwd,
+          canonicalCwd: item.entry.canonicalCwd ?? item.entry.cwd,
+          directoryIdentity: item.directoryIdentity,
+          workspaceId: item.workspaceId,
+        });
+        room.members = item.members;
+        room.sessionIds = item.members.map((member) => member.sessionId);
+        state.rooms.push(room);
+        known.add(item.workspaceId);
+      }
+      for (const entry of state.creationIntents ?? []) {
+        if (adoptedIds.has(entry.id)) entry.state = 'ADOPTED';
+        else if (abandonedIds.has(entry.id)) entry.state = 'ABANDONED';
+      }
+      // 意图本身保留（只改状态）：它是「这次收尾为什么没落盘」的审计证据，删掉就查不到了。
     });
-    if (stale.length === 0) return {intentsAbandoned: 0};
-    const ids = new Set(stale.map((entry) => entry.id));
-    await this.#update((state) => {
-      for (const entry of state.creationIntents ?? []) if (ids.has(entry.id)) entry.state = 'ABANDONED';
-    });
-    return {intentsAbandoned: stale.length};
+    if (written.ok === false) {
+      this.degrade(written.code ?? REASON.LEDGER_WRITE_FAILED, 'creation intents could not be persisted');
+      return {blocked: written.code ?? REASON.LEDGER_WRITE_FAILED};
+    }
+    if (adopted.length > 0) this.#log({event: 'creation-intents-adopted', count: adopted.length});
+    return {intentsAbandoned: abandoned.length, intentsAdopted: adopted.length};
   }
 
   /**
@@ -529,6 +603,30 @@ export class LifecycleCoordinator {
         continue;
       }
 
+      // 最后确认里看到的新同目录成员必须先进账本，再删登记：否则「已经读到、却没记下」
+      // 的成员会在重新启用时丢掉（复审 R2-F06）。这一步写失败就不删。
+      const knownIds = new Set([...(room.sessionIds ?? []), ...derived]);
+      const lateDerived = latest === undefined ? [] : await this.#derivedMembers(room, latest.sessionIds, knownIds);
+      if (lateDerived.length > 0) {
+        const recorded = await this.#updateRequired((state) => {
+          const index = (state.rooms ?? []).findIndex((entry) => entry.workspaceId === room.workspaceId);
+          if (index === -1) return;
+          const roomIds = new Set(state.rooms[index].sessionIds ?? []);
+          for (const sessionId of lateDerived) roomIds.add(sessionId);
+          state.rooms[index].sessionIds = [...roomIds];
+          const memberIds = new Set((state.rooms[index].members ?? []).map((member) => member.sessionId));
+          state.rooms[index].members = [
+            ...(state.rooms[index].members ?? []),
+            ...lateDerived.filter((sessionId) => !memberIds.has(sessionId)).map((sessionId) => ({sessionId, eligibility: ELIGIBILITY.ELIGIBLE})),
+          ];
+        });
+        if (recorded.ok === false) {
+          result.failed.push({sessionId: room.ownerSessionId, code: recorded.code ?? REASON.LEDGER_WRITE_FAILED});
+          continue;
+        }
+        result.lateMembers = [...(result.lateMembers ?? []), ...lateDerived];
+      }
+
       const removed = await deleteWorkspace(this.#ctx, room.workspaceId);
       if (removed.ok === false) {
         await this.#transitionRoom(room.workspaceId, ROOM_STATE.MANAGED, {
@@ -584,6 +682,8 @@ export class LifecycleCoordinator {
     for (const sessionId of sessionIds) {
       if (own.has(sessionId)) continue;
       const header = await readSessionHeader(this.#ctx, sessionId);
+      // 子代理与宿主共享 cwd，但它不归插件托管（R14）：既不算外来成员，也不补账。
+      if (isSubagentHeader(header)) continue;
       const cwd = headerCwd(header);
       if (typeof cwd === 'string' && canonicalPath(cwd) === room.canonicalCwd) continue;
       foreign.push(sessionId);
@@ -603,6 +703,7 @@ export class LifecycleCoordinator {
     for (const sessionId of sessionIds) {
       if (own.has(sessionId)) continue;
       const header = await readSessionHeader(this.#ctx, sessionId);
+      if (isSubagentHeader(header)) continue;
       const cwd = headerCwd(header);
       if (typeof cwd === 'string' && canonicalPath(cwd) === room.canonicalCwd) derived.push(sessionId);
     }
@@ -628,8 +729,12 @@ export class LifecycleCoordinator {
    * 都不会被强行改回 MANAGED。
    */
   async #restore(ledger) {
+    // PARTIAL 也要进候选：上次某成员临时挂载失败时，下一次启用必须能把它补齐（复审 R2-F08）。
     const candidates = (ledger?.rooms ?? []).filter((room) =>
-      room.state === ROOM_STATE.RESTORING || room.state === ROOM_STATE.DETACHED || room.state === ROOM_STATE.DETACHING);
+      room.state === ROOM_STATE.RESTORING
+      || room.state === ROOM_STATE.DETACHED
+      || room.state === ROOM_STATE.DETACHING
+      || room.state === ROOM_STATE.PARTIAL);
     const summary = {restored: [], partial: [], released: [], conflicts: [], skipped: []};
     if (candidates.length === 0) return summary;
 
@@ -656,13 +761,24 @@ export class LifecycleCoordinator {
       for (const sessionId of room.sessionIds ?? []) {
         const header = await readSessionHeader(this.#ctx, sessionId);
         const claimedBy = registry.claimedBy.get(sessionId) ?? null;
-        const eligibility = classifyMember({header, claimedBy, canonicalCwd: room.canonicalCwd, workspaceId: room.workspaceId});
+        const eligibility = classifyMember({
+          header,
+          claimedBy,
+          isSubagent: isSubagentHeader(header),
+          canonicalCwd: room.canonicalCwd,
+          workspaceId: room.workspaceId,
+        });
         members.push({sessionId, eligibility});
       }
       const eligible = members.filter((member) => member.eligibility === ELIGIBILITY.ELIGIBLE).map((member) => member.sessionId);
       const userOwned = members.filter((member) => member.eligibility === ELIGIBILITY.USER_OWNED);
       const conflicted = members.filter((member) => member.eligibility === ELIGIBILITY.CONFLICT || member.eligibility === ELIGIBILITY.MISSING_SESSION);
 
+      // 已经没有可重试成员（都挂上了或都成了用户收编）：保持原状，不把 PARTIAL 降级成 CONFLICT。
+      if (room.state === ROOM_STATE.PARTIAL && eligible.length === 0) {
+        summary.skipped.push(room.ownerSessionId);
+        continue;
+      }
       if (eligible.length === 0 && userOwned.length > 0) {
         await this.#transitionRoom(room.workspaceId, ROOM_STATE.RELEASED, {
           error: {phase: 'restore', code: REASON.USER_CLAIMED, reason: REASON.USER_CLAIMED, at: new Date().toISOString()},
@@ -678,7 +794,8 @@ export class LifecycleCoordinator {
         continue;
       }
 
-      await this.#update((state) => {
+      // 恢复意图必须真的落盘：写不进去就停在这个房间，不创建原生工作区、不挂成员（复审 R2-F02）。
+      const intent = await this.#updateRequired((state) => {
         const index = (state.rooms ?? []).findIndex((entry) => entry.workspaceId === room.workspaceId);
         if (index === -1) return;
         state.rooms[index] = roomTransition(state.rooms[index], ROOM_STATE.RESTORING, {
@@ -694,6 +811,13 @@ export class LifecycleCoordinator {
         state.rooms[index].members = members;
         state.rooms[index].directoryIdentity = directoryIdentityOf(stat) ?? state.rooms[index].directoryIdentity;
       });
+      if (intent.ok === false) {
+        this.degrade(intent.code ?? REASON.LEDGER_WRITE_FAILED, 'restore intent could not be persisted');
+        // 意图没落盘就等于这次恢复没有持久阶段依据：整个启动不许走到 READY（复审 R2-F02）。
+        summary.blocked = intent.code ?? REASON.LEDGER_WRITE_FAILED;
+        summary.conflicts.push(room.ownerSessionId);
+        continue;
+      }
 
       // 同路径登记分三种：自己的（id 与账本一致）、别人的（用户新登记）、没有。
       // 只有「id 与账本一致」才能复用；用户自己登记的同路径工作区说明这个 cwd 已被收编，
