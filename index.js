@@ -328,7 +328,9 @@ export function apply(ctx, config) {
     await lifecycleReady;
     if (coordinator === undefined) return null;
     const described = await coordinator.describe();
-    if (described.state === 'degraded' && described.managed.workspaceIds.length === 0) return new Set();
+    // 进程不在 READY（DEGRADED / QUIESCING / DISPOSED）时托管集合一律为空：
+    // 维护逻辑据此跳过所有写操作，不再拿「路径形状」或旧账本内容当许可（复审 R2-F05）。
+    if (described.state !== PROCESS_STATE.READY) return new Set();
     return new Set(described.managed.workspaceIds);
   }
 
@@ -338,6 +340,8 @@ export function apply(ctx, config) {
     await lifecycleReady;
     if (coordinator === undefined) return null;
     const described = await coordinator.describe();
+    // 同上：不可写时没有任何会话是「可维护」的，避免 DEGRADED 下改标题／建软链接。
+    if (described.state !== PROCESS_STATE.READY) return new Set();
     return new Set(described.managed.sessionIds);
   }
 
@@ -786,6 +790,11 @@ export function apply(ctx, config) {
   /** Sync links and membership without changing archive flags; boot also reclaims archived empty cwds. */
   function sweep(only, options = {}) {
     const run = async () => {
+      // 交接边界：sweep 是已接收的插件任务，必须能被 dispose 排空；一旦冻结或 generation 变了，
+      // 后续任何副作用（补目录、软链接、改标题、删登记）都不许再发生（复审 R2-F05）。
+      const gate = coordinator === undefined ? null : coordinator.generation;
+      const stale = () => coordinator !== undefined
+        && (coordinator.canWrite() === false || coordinator.generation !== gate);
       const durable = await ctx.sessionPersistence.list();
       const archived = new Set(ctx.workspaceRegistry.archivedSessionIds);
       const reports = [];
@@ -803,6 +812,10 @@ export function apply(ctx, config) {
         }
         const facts = await logFacts(sessionId, snapshot.sizeBytes);
         if (facts === null) continue;
+        if (stale()) {
+          reports.push({ status: 'skipped-lifecycle', sessionId });
+          continue;
+        }
 
         // Message-free logs do not imply abandonment: selection and unsent drafts live
         // in the browser. Respect the native archive flag, including during plugin activation.
@@ -933,7 +946,10 @@ export function apply(ctx, config) {
   // unref'd so it never keeps the process alive. Boot runs the same sweep plus disk reclamation.
   ctx.effect(() => {
     const sweepNow = (options) => {
-      sweep(undefined, options).catch((error) => {
+      // 启动与定时 sweep 都是「插件已接收的任务」：登记进 coordinator，dispose 时才排得空。
+      const work = sweep(undefined, options);
+      const tracked = coordinator === undefined ? work : coordinator.track(work);
+      tracked.catch((error) => {
         ctx.logger?.warn?.(`[chat-sessions] sweep failed: ${messageOf(error)}`);
       });
     };
@@ -1157,7 +1173,8 @@ export function apply(ctx, config) {
           const requested = typeof body.sessionId === 'string' && body.sessionId !== ''
             ? new Set([body.sessionId])
             : undefined;
-          const links = await sweep(requested);
+          const linkWork = sweep(requested);
+          const links = await (coordinator === undefined ? linkWork : coordinator.track(linkWork));
           // A single-session request must answer "what happened to this session" even when the
           // sweep found nothing to change, so callers never have to infer `ok` from an empty list.
           if (requested !== undefined) {
