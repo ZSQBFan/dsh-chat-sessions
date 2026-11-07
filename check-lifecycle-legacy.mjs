@@ -458,7 +458,13 @@ test('9 其它 root/profile 的账本不算当前 scope 的「账本已存在」
   const afterOwn = await auditReadOnly(fixture);
   const ownRoom = roomOf(afterOwn);
   assert.equal(afterOwn.scope.ledgerExists, true, '当前 scope 的账本必须被认出来');
-  assert.deepEqual(afterOwn.scope.migrationSources, [own.path], '审计读的必须是 store 写的那一份');
+  // 账本 + 初始化标记都属于「本 scope 已经初始化过」的证据，审计读的必须是 store 写的那一份。
+  assert.deepEqual(
+    [...afterOwn.scope.migrationSources].sort(),
+    [own.path, join(dirname(own.path), 'initialized.json')].sort(),
+    '审计读的必须是 store 写的那一份',
+  );
+  assert.equal(afterOwn.scope.initialized, true, '初始化标记必须被审计看到');
   assert.equal(ownRoom.classification, LEGACY_CLASSIFICATION.AMBIGUOUS);
   assert.equal(ownRoom.reason, LEGACY_REASON.LEDGER_PRESENT);
   assert.equal(ownRoom.adoptable, false);

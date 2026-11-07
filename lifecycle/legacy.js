@@ -95,6 +95,7 @@ const LEDGER_FILE = 'ledger.json';
 const MIGRATION_FILE = 'migration.json';
 const QUARANTINE_DIR = 'quarantine';
 const LOCK_FILE = 'lock.json';
+const INITIALIZED_MARKER_FILE = 'initialized.json';
 
 /** 会话日志前缀读取上限：截断的 zstd 帧也能解出首个 header 行。 */
 const HEADER_READ_LIMITS = Object.freeze([8 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024]);
@@ -144,6 +145,8 @@ export const LEGACY_REASON = Object.freeze({
   LEDGER_MISSING: 'LEDGER_MISSING',
   /** 账本已存在：迁移已走过，本审计不接管，交 coordinator 对账。 */
   LEDGER_PRESENT: 'LEDGER_PRESENT',
+  /** 初始化标记在、账本没了：存储层已判定 LEDGER_MISSING_AFTER_INIT，审计不得再报可认领。 */
+  INITIALIZED_WITHOUT_LEDGER: 'INITIALIZED_WITHOUT_LEDGER',
   /** 路径形状不是房间目录（含 root 内非 `.sessions/session-*` 的普通工作区）。 */
   NOT_SESSION_DIRECTORY: 'NOT_SESSION_DIRECTORY',
   /** `.sessions/<id>` 是软链接，且指向 root 之外。 */
@@ -178,6 +181,7 @@ const REASON_ORDER = Object.freeze([
   LEGACY_REASON.SYMLINK_DIRECTORY,
   LEGACY_REASON.OUTSIDE_ROOT,
   LEGACY_REASON.NOT_SESSION_DIRECTORY,
+  LEGACY_REASON.INITIALIZED_WITHOUT_LEDGER,
   LEGACY_REASON.LEDGER_MISSING,
   LEGACY_REASON.LEDGER_PRESENT,
   LEGACY_REASON.DIRECTORY_IDENTITY_CHANGED,
@@ -500,6 +504,8 @@ function normalizeRegistry(snapshot, diagnostics) {
 async function readScopeStateFromDisk({ dshHome, scopeId, diagnostics }) {
   const state = {
     ledgerExists: false,
+    /** 初始化标记（initialized.json）：存储层用它区分「首次安装」与「账本丢失」。 */
+    initialized: false,
     migrationCompleted: false,
     residue: false,
     weakResidue: false,
@@ -531,6 +537,10 @@ async function readScopeStateFromDisk({ dshHome, scopeId, diagnostics }) {
   if (names.includes(QUARANTINE_DIR)) {
     state.residue = true;
     state.migrationSources.push(join(directory, QUARANTINE_DIR));
+  }
+  if (names.includes(INITIALIZED_MARKER_FILE)) {
+    state.initialized = true;
+    state.migrationSources.push(join(directory, INITIALIZED_MARKER_FILE));
   }
   if (names.includes(LOCK_FILE)) state.weakResidue = true;
   return state;
@@ -982,6 +992,11 @@ export async function auditLegacyRooms(options = {}) {
     if (scopeState.ledgerExists === true) {
       addReason(reasons, LEGACY_REASON.LEDGER_PRESENT);
     }
+    // 存储层已经认定「初始化标记在、账本没了」= 账本丢失：审计必须给同一个事实，
+    // 否则独立调用审计的工具会把它报成可认领，与 LedgerStore 的 invalid 矛盾（复审 R2-F09）。
+    if (scopeState.ledgerExists === false && scopeState.initialized === true) {
+      addReason(reasons, LEGACY_REASON.INITIALIZED_WITHOUT_LEDGER);
+    }
     if (previouslyAdopted) {
       addReason(reasons, LEGACY_REASON.LEDGER_MISSING);
     }
@@ -1167,6 +1182,7 @@ export async function auditLegacyRooms(options = {}) {
     sessionsRoot,
     scope: {
       ledgerExists: scopeState.ledgerExists,
+      initialized: scopeState.initialized === true,
       migrationCompleted: scopeState.migrationCompleted,
       residue: scopeState.residue,
       weakResidue: scopeState.weakResidue,
