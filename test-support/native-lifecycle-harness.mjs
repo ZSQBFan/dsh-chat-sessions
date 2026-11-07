@@ -12,7 +12,7 @@
 //   LC_FROM_DEFAULT 首次建 profile 时设 1
 //
 // 输出：一行 `@@NATIVE@@ {json}`，随后进程退出 0；断言失败时打印 `@@NATIVE_FAIL@@`。
-import {appendFile, mkdir, readFile, writeFile} from 'node:fs/promises';
+import {appendFile, mkdir, readFile, realpath, writeFile} from 'node:fs/promises';
 import {randomUUID} from 'node:crypto';
 import path from 'node:path';
 
@@ -101,7 +101,16 @@ async function ledger() {
   return null;
 }
 
-const result = {ok: false, checks: [], steps, evidence: {}};
+async function findWorkspaceAt(workspaces, cwd) {
+  const target = await realpath(cwd).catch(() => path.resolve(cwd));
+  for (const workspace of workspaces) {
+    if (typeof workspace?.path !== 'string') continue;
+    const candidate = await realpath(workspace.path).catch(() => path.resolve(workspace.path));
+    if (candidate === target) return workspace;
+  }
+  return undefined;
+}
+
 function check(name, condition, detail) {
   result.checks.push({name, pass: condition === true, detail});
   if (condition !== true) result.ok = false;
@@ -241,8 +250,9 @@ try {
     check('remove-bundle-keeps-second-directory',
       await readFile(path.join(pinnedCwd, 'keep.txt'), 'utf8') === 'native-user-data-2');
     const registryAfterRemove = registry.list();
-    check('remove-bundle-clears-registration',
-      registryAfterRemove.some((entity) => entity.path === archivedCwd || entity.path === pinnedCwd) === false,
+    const removedArchived = await findWorkspaceAt(registryAfterRemove, archivedCwd);
+    const removedPinned = await findWorkspaceAt(registryAfterRemove, pinnedCwd);
+    check('remove-bundle-clears-registration', removedArchived === undefined && removedPinned === undefined,
       {paths: registryAfterRemove.map((entity) => entity.path)});
     const rowsAfterRemove = await manager.listPlugins();
     check('remove-bundle-plugin-gone',
