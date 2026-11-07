@@ -1345,7 +1345,10 @@ export function apply(ctx, config) {
         }
         if (req.method === 'POST' && url.pathname === `${ROUTE_PREFIX}/unarchive`) {
           await readJsonBody(req);
-          answer(res, 200, { ok: true, ...await unarchiveAll() });
+          const result = coordinator === undefined
+            ? await unarchiveAll()
+            : await coordinator.track(Promise.resolve().then(() => unarchiveAll()));
+          answer(res, 200, { ok: true, ...result });
           return;
         }
         if (req.method === 'GET' && url.pathname === `${ROUTE_PREFIX}/diagnostics`) {

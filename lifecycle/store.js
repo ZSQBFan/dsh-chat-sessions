@@ -25,7 +25,7 @@
  * 契约：docs/lifecycle/04-IMPLEMENTATION-CONTRACT.md §2、§4、§5。
  */
 import { createHash, randomBytes } from 'node:crypto';
-import { appendFile, copyFile, mkdir, open, readFile, realpath, rename, unlink, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, open, readFile, realpath, rename, unlink, writeFile } from 'node:fs/promises';
 import { homedir, hostname } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 
@@ -348,7 +348,7 @@ export class LedgerStore {
    * 关键区别：`ledger.json` 缺失只有在「初始化标记也不存在」时才算首次安装；
    * 标记在而账本没了 → `LEDGER_MISSING_AFTER_INIT`，保持 invalid，绝不重建。
    */
-  async #loadFromDisk() {
+  async #loadFromDisk({ reconcileHistory = true } = {}) {
     const marker = await this.#readInitializationMarker();
     this.#initializationMarker = marker;
     let raw;
@@ -380,7 +380,7 @@ export class LedgerStore {
     // 账本在、标记不在（老版本升级或标记被误删）：账本才是权威，补写标记。
     if (this.#status === 'ready' && marker !== 'present') await this.#repairInitializationMarker();
     // 账本比提交历史更旧：上次提交后崩溃／回滚未完成，按历史恢复（诊断留痕）。
-    if (this.#status === 'ready') await this.#reconcileWithHistory();
+    if (reconcileHistory && this.#status === 'ready') await this.#reconcileWithHistory();
   }
 
   /**
@@ -506,7 +506,7 @@ export class LedgerStore {
 
   /** 在锁内重读磁盘，吸收其他 writer 已提交的 revision（并复核初始化标记）。 */
   async #reload() {
-    await this.#loadFromDisk();
+    await this.#loadFromDisk({ reconcileHistory: false });
   }
 
   // ── 原子写 ────────────────────────────────────────────────────────────────
@@ -517,7 +517,7 @@ export class LedgerStore {
    * fencing 放在 rename 之前：确认锁还是自己的、磁盘 revision 仍等于本次基线，
    * 任何一条不成立就抛 `LOCK_LOST`／`REVISION_CONFLICT`，临时文件被清理。
    * @param {object} state 已归一化的新账本。
-   * @param {{token: string, expectedRevision: number, baseAbsent: boolean}} fence
+   * @param {{token: string, expectedRevision: number, baseAbsent: boolean, allowRecovery?: boolean}} fence
    */
   async #writeAtomic(state, fence) {
     const token = randomBytes(8).toString('hex');
@@ -531,18 +531,31 @@ export class LedgerStore {
       await handle.close();
       handle = null;
       await this.#fenceCommit(fence);
-      await rename(temporary, this.#path);
-      // rename 之后再看一次锁：fencing 与 rename 之间没有 OS 级条件写，
-      // 若这期间锁被接管（旧进程被 SIGSTOP 后恢复就是这种情况），本次写入已经盖掉了
-      // 对方的提交。先把完整状态追加进 history，再判断归属；锁不是自己的就按 history
-      // 里最新的提交回滚，并如实报 LOCK_LOST（不假装提交成功）。
-      await this.#appendHistory(state);
+      // 先写 prepared 记录并 fsync；只有主账本 rename 成功后才写 committed 记录。
+      await this.#appendHistory(state, 'prepared');
       if ((await this.#ownsLock(fence.token)) === false) {
-        const rolled = await this.#rollbackToNewestHistory(state);
+        throw new LedgerWriteError('提交前发现锁已易主或消失，拒绝写入（本次事务未提交）', {
+          code: WRITE_ERROR_CODE.LOCK_LOST,
+        });
+      }
+      await rename(temporary, this.#path);
+      if ((await this.#ownsLock(fence.token)) === false) {
+        const rolled = fence.allowRecovery === false ? false : await this.#rollbackToNewestHistory(state);
         throw new LedgerWriteError(
           rolled
             ? '提交后发现锁已易主：已回滚到接管者最后一次提交，本次写入未生效'
-            : '提交后发现锁已易主：历史里没有更新的提交，账本保留本次内容但归并未确认',
+            : '提交后发现锁已易主：未取得恢复锁，本次提交结果待接管者或下次启动对账',
+          { code: WRITE_ERROR_CODE.LOCK_LOST },
+        );
+      }
+      await this.#appendHistory(state, 'committed');
+      // 仅在 history 里确有更新提交时恢复，并如实报告 LOCK_LOST。
+      if ((await this.#ownsLock(fence.token)) === false) {
+        const rolled = fence.allowRecovery === false ? false : await this.#rollbackToNewestHistory(state);
+        throw new LedgerWriteError(
+          rolled
+            ? '提交后发现锁已易主：已回滚到接管者最后一次提交，本次写入未生效'
+            : '提交后发现锁已易主：未取得恢复锁，本次提交结果待接管者或下次启动对账',
           { code: WRITE_ERROR_CODE.LOCK_LOST },
         );
       }
@@ -562,21 +575,32 @@ export class LedgerStore {
     return lock !== null && lock !== 'unreadable' && typeof lock === 'object' && !Array.isArray(lock) && lock.token === token;
   }
 
-  /**
-   * 每次成功 rename 之后追加一行完整状态。
-   *
-   * 用途只有一个：当提交后才发现锁已易主时，用「接管者最后一次提交」而不是自己更旧的
-   * 内存快照去回滚。追加失败不否决已经落盘的账本（降级记诊断）。
-   */
-  async #appendHistory(state) {
+  /** 追加一行完整状态并 fsync history 文件；失败时主账本尚未替换。 */
+  async #appendHistory(state, phase = 'committed') {
+    const text = `${JSON.stringify({at: new Date().toISOString(), phase, generation: state.generation, revision: state.revision, state})}\n`;
+    let handle = null;
     try {
-      await appendFile(this.#historyPath, `${JSON.stringify({at: new Date().toISOString(), generation: state.generation, revision: state.revision, state})}\n`, {mode: 0o600});
+      handle = await open(this.#historyPath, 'a', 0o600);
+      await handle.writeFile(text, 'utf8');
+      await handle.sync();
     } catch (error) {
-      this.#diagnostics.push({code: REASON.LEDGER_WRITE_FAILED, message: `提交历史追加失败（账本本身已落盘）: ${error.message}`});
+      const committed = phase === 'committed';
+      throw new LedgerWriteError(
+        committed
+          ? `提交历史写入失败（主账本已替换，持久性不确定）: ${error.message}`
+          : `提交历史准备失败，主账本尚未替换: ${error.message}`,
+        {
+          cause: error,
+          code: committed ? WRITE_ERROR_CODE.DURABILITY_UNKNOWN : WRITE_ERROR_CODE.WRITE_FAILED,
+          ...(committed ? {durabilityUnknown: true} : {}),
+        },
+      );
+    } finally {
+      if (handle !== null) await handle.close().catch(() => {});
     }
   }
 
-  /** 读历史里 generation 最新的一条（坏行跳过）。 */
+  /** 读历史中最新的已验证提交；generation/revision 都必须与状态信封一致。 */
   async #readNewestHistory() {
     let text;
     try {
@@ -588,74 +612,139 @@ export class LedgerStore {
     for (const line of text.split('\n')) {
       if (line.trim() === '') continue;
       let entry;
-      try {
-        entry = JSON.parse(line);
-      } catch {
-        continue;
-      }
+      try { entry = JSON.parse(line); } catch { continue; }
       if (entry === null || typeof entry !== 'object' || entry.state === undefined) continue;
-      const generation = Number(entry.generation);
-      if (!Number.isFinite(generation)) continue;
-      if (best === null || generation > best.generation) best = {generation, state: entry.state};
+      if (entry.phase === 'prepared') continue;
+      if (entry.phase !== undefined && entry.phase !== 'committed') continue;
+      try {
+        const state = normalizeLedger(entry.state);
+        const generation = Number(state.generation);
+        const revision = Number(state.revision);
+        if (state.scopeId !== this.#scopeId
+          || !Number.isSafeInteger(generation)
+          || !Number.isSafeInteger(revision)
+          || Number(entry.generation) !== generation
+          || Number(entry.revision) !== revision) continue;
+        const candidate = {generation, revision, state};
+        if (best === null || compareCommit(candidate, best) > 0) best = candidate;
+      } catch {
+        // History is advisory recovery data. Invalid or foreign entries never overwrite a valid ledger.
+      }
     }
     return best;
   }
 
-  /**
-   * 回滚到历史里 generation 更高的那条提交。
-   * 只有「对方确实更新」才动手；否则保留本次写入（返回 false）。
-   */
+  /** 在新的锁内按历史安全恢复；失锁 writer 自身不能直接 rename。 */
+  async #recoverHistorySafely(mine) {
+    let token;
+    try {
+      token = await this.#acquireRecoveryLock();
+    } catch {
+      return false;
+    }
+    const heartbeat = this.#startLeaseHeartbeat(token);
+    try {
+      await this.#reload();
+      if (this.#status === 'invalid') return false;
+      const current = this.#state;
+      const newest = await this.#readNewestHistory();
+      const baseline = current ?? mine;
+      if (newest === null || compareCommit(newest, commitOf(baseline)) <= 0) return false;
+      if (current !== null && compareCommit(commitOf(current), newest) >= 0) return false;
+      await this.#writeAtomic(newest.state, {
+        token,
+        expectedRevision: current?.revision ?? 0,
+        baseAbsent: current === null,
+        allowRecovery: false,
+      });
+      this.#state = structuredClone(newest.state);
+      this.#status = 'ready';
+      this.#diagnostics.push({code: WRITE_ERROR_CODE.LOCK_LOST, message: `已在新锁内恢复到 generation=${newest.generation}, revision=${newest.revision}`});
+      return true;
+    } catch {
+      return false;
+    } finally {
+      this.#stopLeaseHeartbeat(heartbeat);
+      await heartbeat.settled;
+      await this.#releaseLock(token);
+    }
+  }
+
+  /** 失锁后只通过新锁进行补偿，永远不直接覆盖接管者。 */
   async #rollbackToNewestHistory(mine) {
-    const newest = await this.#readNewestHistory();
-    if (newest === null || newest.generation <= (mine.generation ?? 0)) return false;
-    const text = `${JSON.stringify(newest.state, null, 2)}\n`;
-    const temporary = join(this.#directory, `ledger.json.rollback-${randomBytes(8).toString('hex')}`);
-    await writeFile(temporary, text, {mode: 0o600});
-    await rename(temporary, this.#path);
-    await this.#syncDirectory();
-    this.#diagnostics.push({code: WRITE_ERROR_CODE.LOCK_LOST, message: `已回滚到 generation=${newest.generation} 的接管者提交`});
-    return true;
+    return this.#recoverHistorySafely(mine);
   }
 
-  /** 打开时裁剪历史，避免无限增长。 */
+  /** 打开时裁剪历史，必须与 writer 共享同一把锁并同步目录项。 */
   async #pruneHistory() {
-    let text;
+    let token;
+    try { token = await this.#acquireLock(); } catch { return; }
+    const heartbeat = this.#startLeaseHeartbeat(token);
     try {
-      text = await readFile(this.#historyPath, 'utf8');
-    } catch {
-      return;
-    }
-    const lines = text.split('\n').filter((line) => line.trim() !== '');
-    if (lines.length <= HISTORY_LIMIT * 2) return;
-    const keep = lines.slice(-HISTORY_LIMIT);
-    const temporary = join(this.#directory, `history.jsonl.tmp-${randomBytes(8).toString('hex')}`);
-    try {
-      await writeFile(temporary, `${keep.join('\n')}\n`, {mode: 0o600});
-      await rename(temporary, this.#historyPath);
-    } catch {
-      await unlink(temporary).catch(() => {});
+      let text;
+      try { text = await readFile(this.#historyPath, 'utf8'); } catch { return; }
+      const lines = text.split('\n').filter((line) => line.trim() !== '');
+      if (lines.length <= HISTORY_LIMIT * 2) return;
+      const keep = lines.slice(-HISTORY_LIMIT);
+      const temporary = join(this.#directory, `history.jsonl.tmp-${randomBytes(8).toString('hex')}`);
+      let handle = null;
+      try {
+        handle = await open(temporary, 'wx', 0o600);
+        await handle.writeFile(`${keep.join('\n')}\n`, 'utf8');
+        await handle.sync();
+        await handle.close();
+        handle = null;
+        if (!(await this.#ownsLock(token))) throw new LockHeldError('裁剪历史前锁已易主');
+        await rename(temporary, this.#historyPath);
+        await this.#syncDirectory();
+      } finally {
+        if (handle !== null) await handle.close().catch(() => {});
+        await unlink(temporary).catch(() => {});
+      }
+    } catch (error) {
+      this.#diagnostics.push({code: REASON.LEDGER_WRITE_FAILED, message: `历史裁剪失败: ${error.message}`});
+    } finally {
+      this.#stopLeaseHeartbeat(heartbeat);
+      await heartbeat.settled;
+      await this.#releaseLock(token);
     }
   }
 
   /**
-   * 打开时的历史对账：账本 generation 落后于历史里的最新提交，说明上次提交后崩溃或
-   * 回滚没写完，按历史恢复（诊断留痕），不留「文件比历史更旧」的静默状态。
+   * 打开时的历史对账：必须在独占锁内重新读取当前 ledger，并通过 revision fence 写回。
    */
   async #reconcileWithHistory() {
     const newest = await this.#readNewestHistory();
     if (newest === null) return;
-    if (newest.generation <= (this.#state?.generation ?? 0)) return;
-    const temporary = join(this.#directory, `ledger.json.recover-${randomBytes(8).toString('hex')}`);
+    const current = this.#state;
+    if (current !== null && compareCommit(newest, commitOf(current)) <= 0) return;
+    let token;
+    try { token = await this.#acquireRecoveryLock(); } catch (error) {
+      this.#diagnostics.push({code: WRITE_ERROR_CODE.LOCK_LOST, message: `启动历史对账未取得锁: ${error.message}`});
+      return;
+    }
+    const heartbeat = this.#startLeaseHeartbeat(token);
     try {
-      await writeFile(temporary, `${JSON.stringify(newest.state, null, 2)}\n`, {mode: 0o600});
-      await rename(temporary, this.#path);
-      await this.#syncDirectory();
-      this.#diagnostics.push({code: WRITE_ERROR_CODE.LOCK_LOST, message: `启动对账：按历史恢复到 generation=${newest.generation}`});
+      await this.#reload();
+      if (this.#status === 'invalid') return;
+      const latest = this.#state;
+      if (latest !== null && compareCommit(newest, commitOf(latest)) <= 0) return;
+      const expectedRevision = latest?.revision ?? 0;
+      await this.#writeAtomic(newest.state, {
+        token,
+        expectedRevision,
+        baseAbsent: latest === null,
+        allowRecovery: false,
+      });
       const raw = await readFile(this.#path);
       await this.#adopt(raw);
+      this.#diagnostics.push({code: WRITE_ERROR_CODE.LOCK_LOST, message: `启动对账：按历史恢复到 generation=${newest.generation}, revision=${newest.revision}`});
     } catch (error) {
-      await unlink(temporary).catch(() => {});
-      this.#diagnostics.push({code: REASON.LEDGER_WRITE_FAILED, message: `启动对账失败，账本保持原样: ${error.message}`});
+      this.#diagnostics.push({code: REASON.LEDGER_WRITE_FAILED, message: `启动历史对账失败，账本保持原样: ${error.message}`});
+    } finally {
+      this.#stopLeaseHeartbeat(heartbeat);
+      await heartbeat.settled;
+      await this.#releaseLock(token);
     }
   }
 
@@ -772,6 +861,22 @@ export class LedgerStore {
   }
 
   // ── 单 writer 锁 ──────────────────────────────────────────────────────────
+
+  /** Recovery writes use the same conservative lock acquisition as normal updates. */
+  async #acquireRecoveryLock() {
+    const deadline = Date.now() + Math.max(1_000, Math.min(this.#leaseMs, 5_000));
+    let lastError = null;
+    while (Date.now() < deadline) {
+      try {
+        return await this.#acquireLock();
+      } catch (error) {
+        lastError = error;
+        if (error?.code !== 'LOCK_HELD') throw error;
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+    }
+    throw lastError ?? new LockHeldError('恢复对账等待锁超时');
+  }
 
   async #acquireLock() {
     const lockPath = join(this.#directory, 'lock.json');
@@ -937,7 +1042,16 @@ export class LedgerStore {
   }
 }
 
-// ── 内部工具 ────────────────────────────────────────────────────────────────
+function compareCommit(left, right) {
+  const revision = Number(left?.revision ?? 0) - Number(right?.revision ?? 0);
+  if (revision !== 0) return revision;
+  return Number(left?.generation ?? 0) - Number(right?.generation ?? 0);
+}
+
+function commitOf(state) {
+  return {revision: Number(state?.revision ?? 0), generation: Number(state?.generation ?? 0)};
+}
+
 
 function sha256(bytes) {
   return createHash('sha256').update(bytes).digest('hex');
@@ -975,10 +1089,12 @@ function lockBlocks(lock, now = Date.now()) {
   if (typeof lock !== 'object' || Array.isArray(lock)) return true;
   const lease = typeof lock.leaseExpiresAt === 'string' ? Date.parse(lock.leaseExpiresAt) : Number.NaN;
   if (!Number.isFinite(lease)) return true;
-  if (lease <= now) return false;
   const pid = lock.pid;
   if (!Number.isSafeInteger(pid) || pid <= 0) return true;
   if (pid === process.pid) return true;
+  // Lease expiry is only reclaimable after the recorded owner is confirmed dead.
+  // A suspended but live writer must retain ownership; otherwise it can resume after
+  // a second process commits and overwrite that commit during rename.
   return processAlive(pid);
 }
 

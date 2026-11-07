@@ -171,7 +171,14 @@ export async function readSessionHeader(ctx, sessionId) {
   try {
     const result = await persistence.stat(sessionId);
     const header = result?.header ?? result ?? null;
-    return header === null ? null : header;
+    if (header === null || typeof header !== 'object') return header;
+    // 真实 DSH 的 stat 结果在不同版本分别出现过 identity.cwd 与 record.identity.cwd；
+    // 生命周期模型统一消费顶层 cwd，避免把同 cwd 派生会话误判为 FOREIGN。
+    const identityCwd = header.identity?.cwd ?? header.record?.identity?.cwd;
+    if (typeof header.cwd !== 'string' && typeof identityCwd === 'string') {
+      return {...header, cwd: identityCwd};
+    }
+    return header;
   } catch {
     return null;
   }

@@ -11,7 +11,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { fork } from 'node:child_process';
 import { once } from 'node:events';
-import { chmod, copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { chmod, copyFile, mkdir, mkdtemp, open, readFile, readdir, realpath, rename, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -324,8 +324,15 @@ test('4. 锁：存活 pid 拒绝、死 pid/过期租约回收、并发更新不�
   assert.equal(afterDead.revision, 2);
   assert.equal((await readdir(dirname(store.path))).some((name) => name.startsWith('lock.stale-')), true);
 
-  // (c) 存活 pid + 过期租约：回收。
+  // (c) 存活 pid + 过期租约：仍拒绝回收；只有确认 owner 退出后才允许接管。
   await writeFile(lockPath, JSON.stringify({ token: 'expired', pid: 1, hostname: 'x', createdAt: lease(-120_000), leaseExpiresAt: lease(-60_000) }));
+  await assert.rejects(
+    store.update((state) => {
+      state.generation = 2;
+    }),
+    (error) => error instanceof LockHeldError && error.code === 'LOCK_HELD',
+  );
+  await unlink(lockPath); // 测试夹具模拟 owner 已退出，下一次才可获取。
   const afterExpired = await store.update((state) => {
     state.generation = 2;
   });
@@ -588,26 +595,28 @@ test('9. F05 活 writer 租约过期后不得覆盖接管者的提交（心跳 +
   // 立刻挂上第二个监听：worker 恢复后的报告绝不能因为父进程还在 await 而丢失。
   const reportPromise = once(child, 'message');
 
-  // B：租约过期后合法接管（旧实现会在这里抢到锁），提交 generation=10。
+  // B：旧 writer 仍存活（即便租约已过期）时也不得抢锁；这与 dsh-chat 的保守 owner-lock 语义一致。
   await delay(leaseMs * 3);
   const b = await openStore(workspace, { leaseMs });
-  const bWrite = await b.update((state) => {
-    state.generation += 10;
-  });
-  assert.equal(bWrite.revision, 2);
-  assert.equal(bWrite.state.generation, 10);
+  await assert.rejects(
+    b.update((state) => {
+      state.generation += 10;
+    }),
+    (error) => error instanceof LockHeldError && error.code === 'LOCK_HELD',
+  );
 
-  // A 恢复：提交前 fencing 必须拒绝，而不是把 999 写上去。
+  // A 恢复：提交前 fencing 必须拒绝，而不是把旧草稿写上去。
   const [report] = await reportPromise;
   await once(child, 'exit');
   assert.equal(report.phase, 'rejected', '旧事务不得提交成功');
   assert.equal(report.code, CODE_LOCK_LOST);
 
-  const disk = JSON.parse(await readFile(store.path, 'utf8'));
-  assert.equal(disk.generation, 10, '被接管后旧 writer 的草稿绝不能落盘');
-  assert.equal(disk.revision, 2);
-
-  // 恢复后的实例仍基于磁盘 revision 正常写入。
+  // 旧 owner 结束后，新的 writer 才可以接管并提交。
+  const bWrite = await b.update((state) => {
+    state.generation += 10;
+  });
+  assert.equal(bWrite.revision, 2);
+  assert.equal(bWrite.state.generation, 10);
   const resumed = await store.update((state) => {
     state.generation += 1;
   });
@@ -762,4 +771,38 @@ test('11. F08 目录 fsync：平台不支持降级为已知限制，真实 I/O �
   assert.equal(next.revision, 4, '持久性告警之后仍能基于磁盘 revision 继续');
   assert.equal(next.state.generation, 4);
   assert.equal(JSON.parse(await readFile(store.path, 'utf8')).generation, 4);
+});
+
+test('12. history recovery validates scope and revision, and never replaces a newer ledger', async (t) => {
+  const workspace = await makeWorkspace(t);
+  const store = await openStore(workspace);
+  await store.update((state) => { state.generation = 1; });
+  const historyPath = join(dirname(store.path), 'history.jsonl');
+  const baseline = JSON.parse(await readFile(store.path, 'utf8'));
+  const valid = {...baseline, generation: 2, revision: baseline.revision + 1, migration: {...baseline.migration, completed: true}};
+  await writeFile(historyPath, `${JSON.stringify({generation: valid.generation, revision: valid.revision, state: valid})}\n`);
+  const recovered = await openStore(workspace);
+  const recoveredState = await recovered.read();
+  assert.equal(recoveredState.generation, 2);
+  assert.equal(recoveredState.revision, 2);
+  assert.equal(recoveredState.migration.completed, true);
+
+  const sameGeneration = {...recoveredState, generation: 2, revision: 3, migration: {...recoveredState.migration, completed: false}};
+  await writeFile(historyPath, `${JSON.stringify({phase: 'committed', generation: sameGeneration.generation, revision: sameGeneration.revision, state: sameGeneration})}\n`);
+  const sameGenerationReopened = await openStore(workspace);
+  const sameGenerationState = await sameGenerationReopened.read();
+  assert.equal(sameGenerationState.generation, 2);
+  assert.equal(sameGenerationState.revision, 3, '同 generation 仍必须选择较新的 revision');
+  assert.equal(sameGenerationState.migration.completed, false);
+
+  const newer = {...sameGenerationState, generation: 3, revision: 4};
+  await writeFile(store.path, `${JSON.stringify(newer)}\n`);
+  const invalid = {...newer, schemaVersion: 999, generation: 999, revision: 999};
+  const foreign = {...newer, scopeId: 'f'.repeat(32), generation: 1000, revision: 1000};
+  await writeFile(historyPath, `${JSON.stringify({generation: invalid.generation, revision: invalid.revision, state: invalid})}\n${JSON.stringify({generation: foreign.generation, revision: foreign.revision, state: foreign})}\n`);
+  const stable = await openStore(workspace);
+  const stableState = await stable.read();
+  assert.equal(stableState.generation, 3, 'invalid/foreign history must not overwrite a valid ledger');
+  assert.equal(stableState.revision, 4);
+  assert.equal(stable.status, 'ready');
 });

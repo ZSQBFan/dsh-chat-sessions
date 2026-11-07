@@ -50,3 +50,15 @@ R01–R18 全部保留。复审没有推翻任何一条，只暴露了实现与�
 ## 四、仍然缺的宿主能力
 
 `workspaceRegistry` 没有条件删除/条件挂载（无 CAS、无 revision 参数），`mutate(fn)` 只在本进程写链内串行。插件侧把判定收拢在 `host-adapter.js`，接口一到即可替换，不需要改协调器状态机。
+
+## 五、history/锁恢复修复（fix-lifecycle-history-recovery）
+
+这一轮实现参考 `dsh-chat` 的 owner-lock 与可恢复 journal 思路，但按本插件的 `ledger.json` 语义落地：
+
+- 租约过期不再单独构成抢锁依据；只有确认记录中的 PID 已退出，另一个 writer 才能回收锁。这样暂停后仍存活的 writer 不会在恢复时覆盖接管者提交。
+- history 写入分为 `prepared` 与 `committed` 两阶段。prepared 记录先完成文件 fsync，主账本 rename 成功后再追加 committed 记录；history 写失败会让关键 update 失败并携带持久性不确定状态。
+- history 恢复只接受 schema、scopeId、generation、revision 全部一致的 committed 状态，并按 `revision`、再按 `generation` 选择最新提交。
+- rollback 与启动对账都必须重新取得同一把锁，在锁内重读当前账本并通过 revision fence；当前账本已经更新时保留它，避免恢复路径再覆盖后续 writer。
+- history 裁剪也使用同一把锁，并对临时文件和父目录执行 fsync。
+
+新增 `check-lifecycle-store.mjs` 第12项覆盖同代 revision、foreign/invalid history 和“有效账本不得被较新但不合法 history 覆盖”；完整套件当前为 134/134，结构检查为81项。
