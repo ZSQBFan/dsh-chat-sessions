@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "check": "node check.mjs",
-    "test": "node --test check-create.mjs check-archive.mjs check-header.mjs check-gc.mjs check-lifecycle-store.mjs check-lifecycle.mjs check-lifecycle-legacy.mjs",
+    "test": "node --test check-create.mjs check-archive.mjs check-header.mjs check-gc.mjs check-lifecycle-store.mjs check-lifecycle.mjs check-lifecycle-legacy.mjs check-lifecycle-review2.mjs",
     "test:native": "node --test check-archive-native.mjs",
     "test:lifecycle": "node --test check-lifecycle.mjs",
     "test:lifecycle:native": "node --test check-lifecycle-native.mjs",
