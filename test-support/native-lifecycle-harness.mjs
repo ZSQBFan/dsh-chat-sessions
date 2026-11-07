@@ -13,6 +13,7 @@
 //
 // 输出：一行 `@@NATIVE@@ {json}`，随后进程退出 0；断言失败时打印 `@@NATIVE_FAIL@@`。
 import {appendFile, mkdir, readFile, writeFile} from 'node:fs/promises';
+import {randomUUID} from 'node:crypto';
 import path from 'node:path';
 
 const HOME = process.env.LC_NATIVE_HOME;
@@ -137,6 +138,15 @@ try {
   await writeFile(path.join(pinnedCwd, 'keep.txt'), 'native-user-data-2');
   await mkdir(path.join(pinnedCwd, 'nested'), {recursive: true});
 
+  // 共享 cwd（房间 = 目录，R05）：同一房间挂第二条会话，交接必须把它一起算进去，
+  // 而不是当成外来成员把整房间判成 CONFLICT（独立验收 F01 的真实场景）。
+  const sharedId = `session-${randomUUID()}`;
+  const controller = ctx.get('sessionController');
+  await controller.create({sessionId: sharedId, workspaceId: archivedWorkspace});
+  note('shared-session', {sharedId, workspaceId: archivedWorkspace});
+  const sharedBefore = registry.list().find((entity) => entity.id === archivedWorkspace)?.sessionIds ?? [];
+  check('shared-room-has-two-members', sharedBefore.includes(archivedId) && sharedBefore.includes(sharedId), {members: sharedBefore});
+
   let pinOutcome = null;
   try {
     await registry.pinSession(pinnedId);
@@ -155,6 +165,14 @@ try {
   const ledgerAfterDisable = await ledger();
   const states = (ledgerAfterDisable?.rooms ?? []).map((entry) => entry.state);
   check('disable-removes-registration', afterDisable === false, {stillThere: afterDisable});
+  const archivedRoomAfterDisable = (ledgerAfterDisable?.rooms ?? []).find((entry) => entry.cwd === archivedCwd);
+  check('disable-shared-room-detached', archivedRoomAfterDisable?.state === 'DETACHED',
+    {state: archivedRoomAfterDisable?.state, error: archivedRoomAfterDisable?.lastError ?? null});
+  check('disable-shared-room-keeps-both-members',
+    Array.isArray(archivedRoomAfterDisable?.sessionIds)
+      && archivedRoomAfterDisable.sessionIds.includes(archivedId)
+      && archivedRoomAfterDisable.sessionIds.includes(sharedId),
+    {sessionIds: archivedRoomAfterDisable?.sessionIds});
   check('disable-ledger-detached', states.length === 2 && states.every((entry) => entry === 'DETACHED'),
     {states, last: ledgerAfterDisable?.process?.lastDetach?.reason,
       error: ledgerAfterDisable?.process?.lastDetach?.reason});
@@ -185,6 +203,8 @@ try {
   check('enable-registers-room', roomArchived !== undefined, {room: roomArchived?.id ?? null});
   check('enable-registers-second-room', roomPinned !== undefined, {room: roomPinned?.id ?? null});
   check('enable-attaches-session', roomArchived?.sessionIds?.includes(archivedId) === true, {members: roomArchived?.sessionIds});
+  check('enable-restores-shared-member', roomArchived?.sessionIds?.includes(sharedId) === true,
+    {members: roomArchived?.sessionIds, sharedId});
   check('enable-attaches-second-session', roomPinned?.sessionIds?.includes(pinnedId) === true, {members: roomPinned?.sessionIds});
   const ledgerAfterEnable = await ledger();
   const enabledStates = (ledgerAfterEnable?.rooms ?? []).map((entry) => entry.state);
@@ -201,7 +221,39 @@ try {
   const stillSame = registry.list().find((entity) => entity.path === archivedCwd);
   check('hmr-keeps-workspace-id', stillSame !== undefined && stillSame.id === keptId, {before: keptId, after: stillSame?.id});
 
-  result.evidence = {archivedId, pinnedId, archivedCwd, pinnedCwd, archivedWorkspace, pinnedWorkspace, keptId, ledgerAfterEnable: {
+  // ── 原生卸载（bundle remove）：可选阶段，`LC_NATIVE_REMOVE=1` 打开 ──
+  // 宿主先 dispose 再 pnpm remove（plugin-manager removeBundle），所以插件在 dispose 时看到的是
+  // 「bundle 仍安装但 enabled:false」，账本只能如实记 BUNDLE_DISABLE；能证明的是「确实交接了」。
+  if (process.env.LC_NATIVE_REMOVE === '1') {
+    const removal = await manager.removeBundle('dsh-chat-sessions');
+    note('remove', {
+      stage: removal?.stage ?? null,
+      application: removal?.application ?? null,
+      packageExit: removal?.packageResult?.exitCode ?? null,
+    });
+    check('remove-bundle-applied', removal?.application === 'applied', {application: removal?.application});
+    const ledgerAfterRemove = await ledger();
+    const removeStates = (ledgerAfterRemove?.rooms ?? []).map((entry) => entry.state);
+    check('remove-bundle-detaches', removeStates.length === 2 && removeStates.every((entry) => entry === 'DETACHED'),
+      {states: removeStates, last: ledgerAfterRemove?.process?.lastDetach?.reason});
+    check('remove-bundle-keeps-directory',
+      await readFile(path.join(archivedCwd, 'keep.txt'), 'utf8') === 'native-user-data');
+    check('remove-bundle-keeps-second-directory',
+      await readFile(path.join(pinnedCwd, 'keep.txt'), 'utf8') === 'native-user-data-2');
+    const registryAfterRemove = registry.list();
+    check('remove-bundle-clears-registration',
+      registryAfterRemove.some((entity) => entity.path === archivedCwd || entity.path === pinnedCwd) === false,
+      {paths: registryAfterRemove.map((entity) => entity.path)});
+    const rowsAfterRemove = await manager.listPlugins();
+    check('remove-bundle-plugin-gone',
+      rowsAfterRemove.every((entry) => String(entry.moduleName ?? '').includes('dsh-chat-sessions') === false));
+    result.evidence.removeLedger = {
+      states: removeStates,
+      lastDetach: ledgerAfterRemove?.process?.lastDetach ?? null,
+    };
+  }
+
+  result.evidence = {archivedId, pinnedId, sharedId, archivedCwd, pinnedCwd, archivedWorkspace, pinnedWorkspace, keptId, ledgerAfterEnable: {
     revision: ledgerAfterEnable?.revision, rooms: (ledgerAfterEnable?.rooms ?? []).map((entry) => ({state: entry.state, workspaceId: entry.workspaceId})),
   }};
   result.ok = result.checks.every((entry) => entry.pass);

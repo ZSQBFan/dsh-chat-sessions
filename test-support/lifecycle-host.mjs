@@ -116,7 +116,7 @@ export async function createHost({ home, root, config = {} }) {
         const workspace = options.workspaceId === undefined ? undefined : workspaces.find((w) => w.id === options.workspaceId);
         if (options.workspaceId !== undefined && options.cwd !== undefined) throw new Error('workspaceId + cwd');
         if (options.workspaceId !== undefined && workspace === undefined) throw new Error('unknown workspace');
-        const header = { id, cwd: workspace === undefined ? options.cwd : workspace.path, createdAt: Date.now() };
+        const header = { type: 'session', id, cwd: workspace === undefined ? options.cwd : workspace.path, createdAt: Date.now() };
         sessions.set(id, header);
         if (workspace !== undefined && !workspace.sessionIds.includes(id)) workspace.sessionIds.push(id);
         return { sessionId: id };
@@ -191,7 +191,9 @@ export async function createHost({ home, root, config = {} }) {
 
   /** 直接塞一个会话头，模拟「外部已有会话」。 */
   function seedSession({ cwd, id = `session-${randomUUID()}`, origin }) {
-    const header = { id, cwd, createdAt: Date.now() };
+    // 真宿主的 session header 带 type:'session'（legacy 审计据此判定「日志可用」），
+    // 夹具必须同形状，否则审计会把每条会话都当成读不到 header。
+    const header = { type: 'session', id, cwd, createdAt: Date.now() };
     if (origin !== undefined) header.origin = origin;
     sessions.set(id, header);
     return header;

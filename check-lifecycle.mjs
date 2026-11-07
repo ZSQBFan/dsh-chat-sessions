@@ -8,7 +8,7 @@
 //   · 用户收编 → RELEASED，不抢；外来成员 / 目录异常 → CONFLICT，不猜；
 //   · 坏账本 → 停止自动变更；创建意图崩溃 → ABANDONED，无半成品房间。
 import assert from 'node:assert/strict';
-import { mkdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { mkdtemp } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -179,9 +179,14 @@ test('房间里有外来成员时整房间保留登记并标 CONFLICT', async ()
   const { home, host } = await sandbox();
   try {
     const created = await createRoom(host);
-    const intruder = host.seedSession({ cwd: created.cwd });
+    // 「外来」的定义是 cwd 不在这个房间：同 cwd 的派生会话是本房间成员（R05）。
+    const elsewhere = join(home, 'elsewhere');
+    await mkdir(elsewhere, { recursive: true });
+    const intruder = host.seedSession({ cwd: elsewhere });
     const room = host.workspaces.find((workspace) => workspace.id === created.workspaceId);
-    await room.attachSession(intruder.id);
+    // 直接写进登记集合：模拟「历史上挂进来、但后来 header 指向别处」的成员，
+    // 这条路径不经过 attachSession 的 cwd 校验，正是交接时要防的那种不确定归属。
+    room.sessionIds.push(intruder.id);
 
     host.manager.mode = 'plugin-disabled';
     await host.dispose();
@@ -191,6 +196,31 @@ test('房间里有外来成员时整房间保留登记并标 CONFLICT', async ()
     const ledger = await ledgerFor(home);
     assert.equal(ledger.rooms[0].state, 'CONFLICT');
     assert.equal(ledger.rooms[0].lastError.code, 'FOREIGN_MEMBERS');
+  } finally {
+    await host.close();
+  }
+});
+
+test('同 cwd 派生会话算本房间成员：交接时一起入账并清掉登记（R05 / 验收 F01）', async () => {
+  const { home, host } = await sandbox();
+  try {
+    const created = await createRoom(host);
+    const room = host.workspaces.find((workspace) => workspace.id === created.workspaceId);
+    // 宿主允许直接 create 一个继承同 cwd 的会话，账本里当然没有它。
+    const derived = host.seedSession({ cwd: created.cwd });
+    await room.attachSession(derived.id);
+
+    host.manager.mode = 'plugin-disabled';
+    await host.dispose();
+
+    assert.equal(host.workspaces.length, 0, '派生会话不是外来成员，整房间应当交接');
+    const ledger = await ledgerFor(home);
+    assert.equal(ledger.rooms[0].state, 'DETACHED');
+    assert.deepEqual([...ledger.rooms[0].sessionIds].sort(), [created.sessionId, derived.id].sort());
+    assert.deepEqual(
+      ledger.rooms[0].members.map((member) => member.sessionId).sort(),
+      [created.sessionId, derived.id].sort(),
+    );
   } finally {
     await host.close();
   }
@@ -324,6 +354,147 @@ test('交接不产生空壳登记，也不移动标题软链接', async () => {
       linkBefore === null ? 'gone' : 'there', '标题入口不该被交接挪动');
     assert.equal(await stat(join(root, '.archive')).then(() => 'there', () => 'gone'),
       archiveBefore === null ? 'gone' : 'there', '交接不触发归档目录变化');
+  } finally {
+    await host.close();
+  }
+});
+
+test('用户停用期间新注册的同路径空工作区不被接管（验收 F02 / R08）', async () => {
+  const { home, host } = await sandbox();
+  try {
+    const created = await createRoom(host);
+    host.manager.mode = 'plugin-disabled';
+    await host.dispose();
+
+    // 用户在原 cwd 自己登记了一个普通工作区，成员为空。
+    const userRoom = await host.registry.create(created.cwd, '用户自己的房间');
+
+    host.manager.mode = 'enabled';
+    await host.relaunch();
+
+    const ledger = await ledgerFor(home);
+    assert.equal(ledger.rooms[0].state, 'RELEASED');
+    assert.equal(ledger.rooms[0].lastError.code, 'USER_CLAIMED');
+    assert.equal(host.workspaces.length, 1, '不能在同一路径上再建一个登记');
+    assert.equal(host.workspaces[0].id, userRoom.id);
+    assert.deepEqual([...host.workspaces[0].sessionIds], [], '用户工作区的成员集合必须保持原样');
+    assert.equal(host.workspaces[0].title, '用户自己的房间', '不接管就不改用户标题');
+
+    const status = await host.request('/status', {}, 'GET');
+    assert.deepEqual(status.body.managedWorkspaceIds, [], '用户收编的房间不在托管集合里');
+    assert.deepEqual(status.body.managedSessionIds, [], '旧会话也不该被当成托管成员');
+  } finally {
+    await host.close();
+  }
+});
+
+test('PARTIAL 只托管真正挂回去的成员，用户/异常成员保持原资格（验收 F03）', async () => {
+  const { home, host } = await sandbox();
+  try {
+    const created = await createRoom(host);
+    // 同 cwd 派生一条会话（交接时会被收进房间），随后删掉它的 header，
+    // 模拟「账本里有、日志已经不在了」的成员。
+    const derived = host.seedSession({ cwd: created.cwd });
+    await host.workspaces[0].attachSession(derived.id);
+    host.manager.mode = 'plugin-disabled';
+    await host.dispose();
+
+    host.sessions.delete(derived.id); // header 读不到 → MISSING_SESSION
+    host.manager.mode = 'enabled';
+    await host.relaunch();
+
+    const ledger = await ledgerFor(home);
+    const room = ledger.rooms[0];
+    assert.equal(room.state, 'PARTIAL', '一个成员恢复不了就是 PARTIAL，不能报 MANAGED');
+    const memberOf = (id) => room.members.find((member) => member.sessionId === id);
+    assert.equal(memberOf(created.sessionId).eligibility, 'attached');
+    assert.notEqual(memberOf(derived.id).eligibility, 'attached', '没挂回去的成员不能被标成 attached');
+
+    const status = await host.request('/status', {}, 'GET');
+    assert.deepEqual(status.body.managedSessionIds, [created.sessionId], '托管集合只含真正挂回的成员');
+  } finally {
+    await host.close();
+  }
+});
+
+test('账本写不进去时创建直接失败，不留下孤儿会话或半登记（验收 F04 / R10）', async () => {
+  const { home, host } = await sandbox();
+  try {
+    const created = await createRoom(host);
+    const scopes = await readLedgerText(home);
+    const scopeDir = join(home, 'storages', 'dsh-chat-sessions-lifecycle', scopes[0].scope);
+    await chmod(scopeDir, 0o500); // 只读：临时文件 rename 不进去，等同 ENOSPC/EACCES
+    try {
+      const failed = await host.request('/create', {});
+      assert.equal(failed.status, 503, JSON.stringify(failed.body));
+      assert.equal(failed.body.code, 'LIFECYCLE_LEDGER_UNAVAILABLE');
+      assert.equal(host.workspaces.length, 1, '失败请求不许留下新的工作区登记');
+      const status = await host.request('/status', {}, 'GET');
+      assert.equal(status.body.lifecycle.state, 'DEGRADED', '写不进去之后必须停止自动写');
+      const again = await host.request('/create', {});
+      assert.equal(again.status, 409, '降级后不再接受新写');
+    } finally {
+      await chmod(scopeDir, 0o700);
+    }
+    assert.ok(created.sessionId);
+  } finally {
+    await host.close();
+  }
+});
+
+test('非托管工作区既不改标题也不删登记（验收 F07 / R14）', async () => {
+  const { root, host } = await sandbox();
+  try {
+    const created = await createRoom(host);
+    // 形似插件房间、但从未进过账本的用户工作区。
+    const userPath = join(root, '.sessions', 'session-00000000-0000-4000-8000-000000000000');
+    await mkdir(userPath, { recursive: true });
+    const userRoom = await host.registry.create(userPath, '用户自己登记的工作区');
+
+    // 触发一次 sweep + 登记表整理。
+    await host.request('/link', { sessionId: created.sessionId }, 'POST');
+
+    const after = host.workspaces.find((workspace) => workspace.id === userRoom.id);
+    assert.ok(after, '非托管登记不许被删');
+    assert.equal(after.title, '用户自己登记的工作区', '非托管工作区的标题不许被改写');
+  } finally {
+    await host.close();
+  }
+});
+
+test('首次升级：无账本的旧插件房间按多证据认领，证据不足的只留着不动（验收 K01）', async () => {
+  const { home, root, host } = await sandbox();
+  try {
+    // 模拟 v0.1.1：原生登记表里有房间，账本里一个房间都没有。
+    // 房间目录名就是 owner 会话 ID（v0.1.1 的命名），否则审计会把它当空目录。
+    const legacyId = 'session-11111111-1111-4111-8111-111111111111';
+    const legacyCwd = join(root, '.sessions', legacyId);
+    await mkdir(legacyCwd, { recursive: true });
+    await writeFile(join(legacyCwd, 'keep.txt'), 'keep');
+    const legacySession = host.seedSession({ cwd: legacyCwd, id: legacyId });
+    const legacyRoom = await host.registry.create(legacyCwd, '独立对话');
+    await legacyRoom.attachSession(legacySession.id);
+
+    // 目录在、登记在，但会话日志已经没了：证据不足，不许认领。
+    const orphanCwd = join(root, '.sessions', 'session-22222222-2222-4222-8222-222222222222');
+    await mkdir(orphanCwd, { recursive: true });
+    const orphanRoom = await host.registry.create(orphanCwd, '证据不足的房间');
+
+    await host.relaunch();
+
+    const ledger = await ledgerFor(home);
+    assert.equal(ledger.migration.completed, true, '迁移跑过要留可验证标记');
+    assert.equal(ledger.rooms.length, 1, '只认领证据齐全的那一个');
+    assert.equal(ledger.rooms[0].workspaceId, legacyRoom.id);
+    assert.equal(ledger.rooms[0].state, 'MANAGED');
+    assert.deepEqual(ledger.rooms[0].sessionIds, [legacySession.id]);
+
+    const status = await host.request('/status', {}, 'GET');
+    assert.deepEqual(status.body.managedWorkspaceIds, [legacyRoom.id]);
+    assert.deepEqual(status.body.managedSessionIds, [legacySession.id]);
+    assert.ok(host.workspaces.some((workspace) => workspace.id === orphanRoom.id),
+      '证据不足的房间不许被删，也不许被认领');
+    assert.equal(host.workspaces.find((workspace) => workspace.id === orphanRoom.id).title, '证据不足的房间');
   } finally {
     await host.close();
   }
