@@ -11,9 +11,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join, sep } from 'node:path';
 import * as zlib from 'node:zlib';
 
 import {
@@ -22,6 +22,8 @@ import {
   auditLegacyRooms,
   legacyRoomDraft,
 } from './lifecycle/legacy.js';
+import { scopeIdentity } from './lifecycle/model.js';
+import { LedgerStore } from './lifecycle/store.js';
 
 const NOW = Date.UTC(2026, 10, 7, 0, 0, 0);
 const OWNER = 'session-11111111-1111-4111-8111-111111111111';
@@ -140,6 +142,20 @@ async function auditReadOnly(fixture, overrides = {}) {
 
 function roomOf(result, ownerSessionId = OWNER) {
   return result.rooms.find((room) => room.ownerSessionId === ownerSessionId);
+}
+
+/**
+ * 当前 scope 的账本目录，与 `LedgerStore.open()` 同源（realpath(dshHome)、
+ * realpath(root)、缺省 plugin/profile）。用于构造「同 scope」的标记。
+ */
+async function scopeDirectoryOf(fixture, { profileId = 'unknown', pluginId = 'chat-sessions' } = {}) {
+  const scopeId = scopeIdentity({
+    pluginId,
+    profileId,
+    dshHome: await realpath(fixture.dshHome),
+    canonicalRoot: await realpath(fixture.root),
+  });
+  return join(fixture.dshHome, 'storages', 'dsh-chat-sessions-lifecycle', scopeId);
 }
 
 // ── 1. 三条独立证据齐全 → adoptable ──────────────────────────────────────────
@@ -297,7 +313,8 @@ test('6 迁移后账本丢失（有 .links.json、无账本）→ ledger-missing
   await symlink(`.sessions/${OWNER}`, join(fixture.root, '旧房间'));
 
   // 本插件自己的 scope 存储区里留下过“迁移已完成”标记，账本本身却不见了。
-  const scopeDirectory = join(fixture.dshHome, 'storages', 'dsh-chat-sessions-lifecycle', 'a'.repeat(32));
+  // 必须是**当前 scope**（root + profile 身份）的目录：别的 scope 的标记不算证据。
+  const scopeDirectory = await scopeDirectoryOf(fixture);
   await mkdir(scopeDirectory, { recursive: true });
   await writeFile(
     join(scopeDirectory, 'migration.json'),
@@ -380,4 +397,128 @@ test('8 已归档空目录保留，并作为 room 候选（ambiguous，不删）
 
   const entries = await readdir(directory);
   assert.deepEqual(entries, [], '空目录必须原位保留');
+});
+
+// ── 9. 无关 scope 的账本不得阻断首次迁移 ─────────────────────────────────────
+//
+// scope 身份 = plugin + profile + canonical(dshHome) + canonical(root)。同一 DSH_HOME
+// 下别的 root/profile 建了账本，只说明那个 scope 迁移过，与当前 scope 的首次旧房间无关；
+// 拿它当「账本已存在」会把本可 adopt 的房间降级成 ambiguous（OW-11／OW-12）。
+
+test('9 其它 root/profile 的账本不算当前 scope 的「账本已存在」', async (t) => {
+  const fixture = await makeFixture(t);
+  const directory = join(fixture.sessions, OWNER);
+  await mkdir(directory);
+  await writeRegistry(fixture, { 'ws-1': registryEntry(directory, [OWNER]) });
+  await writeSessionLog(fixture, { sessionId: OWNER, cwd: directory });
+
+  const first = await auditReadOnly(fixture);
+  assert.equal(roomOf(first).classification, LEGACY_CLASSIFICATION.ADOPTABLE);
+  assert.equal(first.scope.ledgerExists, false);
+  assert.deepEqual(first.scope.migrationSources, []);
+
+  // 同 DSH_HOME、完全不同 root + profile 的 scope 迁移过。
+  const foreign = await LedgerStore.open({
+    dshHome: fixture.dshHome,
+    canonicalRoot: join(fixture.base, 'other-root'),
+    profileId: 'different-profile',
+  });
+  await foreign.update((state) => {
+    state.migration.completed = true;
+  });
+
+  const afterForeignRoot = await auditReadOnly(fixture);
+  const foreignRoom = roomOf(afterForeignRoot);
+  assert.equal(foreignRoom.classification, LEGACY_CLASSIFICATION.ADOPTABLE, '别的 root 的账本不得降级本 scope 的房间');
+  assert.equal(afterForeignRoot.scope.ledgerExists, false);
+  assert.deepEqual(afterForeignRoot.scope.migrationSources, []);
+  assert.equal(foreignRoom.evidence.adoption.scopeMigrated, false);
+
+  // 同 root、不同 profile：同样不是当前 scope。
+  const foreignProfile = await LedgerStore.open({
+    dshHome: fixture.dshHome,
+    canonicalRoot: fixture.root,
+    profileId: 'another-profile',
+  });
+  await foreignProfile.update((state) => {
+    state.migration.completed = true;
+  });
+
+  const afterForeignProfile = await auditReadOnly(fixture);
+  assert.equal(roomOf(afterForeignProfile).classification, LEGACY_CLASSIFICATION.ADOPTABLE);
+  assert.equal(afterForeignProfile.scope.ledgerExists, false);
+  assert.deepEqual(afterForeignProfile.scope.migrationSources, []);
+
+  // 当前 scope 自己的账本仍然是「账本已存在」：迁移走过就不许再自动 adopt。
+  const own = await LedgerStore.open({ dshHome: fixture.dshHome, canonicalRoot: fixture.root });
+  await own.update((state) => {
+    state.migration.completed = true;
+  });
+
+  const afterOwn = await auditReadOnly(fixture);
+  const ownRoom = roomOf(afterOwn);
+  assert.equal(afterOwn.scope.ledgerExists, true, '当前 scope 的账本必须被认出来');
+  assert.deepEqual(afterOwn.scope.migrationSources, [own.path], '审计读的必须是 store 写的那一份');
+  assert.equal(ownRoom.classification, LEGACY_CLASSIFICATION.AMBIGUOUS);
+  assert.equal(ownRoom.reason, LEGACY_REASON.LEDGER_PRESENT);
+  assert.equal(ownRoom.adoptable, false);
+  assert.equal(afterOwn.counts.adoptable, 0);
+});
+
+// ── 10. 祖先软链接 / `..` / 末尾斜杠不得造成成员冲突 ────────────────────────
+//
+// root 自己经祖先 symlink 指向真实目录时，宿主写下的 workspace.path 与 header.cwd 都是
+// 真实路径；审计从别名 root 进来，前面已用 realpath 认定 cwdMatches=true，后续任何
+// 路径比较都不能退回「未归一的字符串比较」而判 MEMBER_CONFLICT。
+
+test('10 root 经祖先软链接指向真实目录 → 仍 adoptable（等价拼写不分裂）', async (t) => {
+  const fixture = await makeFixture(t);
+  const directory = join(fixture.sessions, OWNER);
+  await mkdir(directory);
+  const realDirectory = await realpath(directory);
+  const realRootPath = await realpath(fixture.root);
+  const alias = join(dirname(fixture.root), 'root-alias');
+  await symlink(realRootPath, alias);
+
+  // 宿主正常行为：registry 与 header 都用真实路径；用户给 root 配了别名软链接。
+  await writeSessionLog(fixture, { sessionId: OWNER, cwd: realDirectory });
+  await writeRegistry(fixture, { 'ws-1': registryEntry(realDirectory, [OWNER]) });
+
+  for (const root of [alias, `${alias}${sep}`, join(alias, '.sessions', '..')]) {
+    const result = await auditLegacyRooms({ root, dshHome: fixture.dshHome, now: NOW });
+    const room = roomOf(result);
+    assert.ok(room, `root=${root} 必须产出房间候选`);
+    assert.equal(room.members[0].cwdMatches, true, `root=${root} 的真实目录已认定相同`);
+    assert.equal(room.members[0].eligibility, 'eligible', `root=${root} 不得判成员冲突`);
+    assert.equal(room.classification, LEGACY_CLASSIFICATION.ADOPTABLE, `root=${root} 不得因拼写差异降级`);
+    assert.equal(room.reason, LEGACY_REASON.EVIDENCE_COMPLETE);
+    assert.deepEqual(room.evidence.score, { directory: true, registry: true, session: true });
+    assert.equal(result.scope.registryOutsideRoot, 0, '真实路径的登记仍属 root 内');
+    assert.equal(result.scope.registryRoomMissing, 0);
+    assert.equal(result.counts.rejected, 0, '登记不得因拼写差异被当成 root 内非房间目录拒绝');
+  }
+
+  // 别名拼写的登记（目录已被删）仍算「root 内缺失」，不得记成 root 外登记。
+  const ghost = 'session-33333333-3333-4333-8333-333333333333';
+  await writeRegistry(fixture, {
+    'ws-1': registryEntry(realDirectory, [OWNER]),
+    'ws-2': registryEntry(join(alias, '.sessions', ghost), []),
+  });
+  const ghosted = await auditLegacyRooms({ root: alias, dshHome: fixture.dshHome, now: NOW });
+  assert.equal(ghosted.scope.registryOutsideRoot, 0, '别名拼写的登记仍在 root 内');
+  assert.equal(ghosted.scope.registryRoomMissing, 1, '缺失房间按 root 内计数');
+
+  // 反向守卫：真的换了目录仍然判冲突，不能靠「一律放行」蒙对。
+  const before = await auditLegacyRooms({ root: alias, dshHome: fixture.dshHome, now: NOW });
+  assert.equal(before.counts.adoptable, 1);
+  // 日志按 cwd 分桶：先撤掉旧桶，避免同一 sessionId 在同一份数据里出现两个 header。
+  const elsewhere = join(fixture.sessions, OTHER);
+  await mkdir(elsewhere, { recursive: true });
+  await rm(await sessionLogDirectory(fixture, realDirectory, OWNER), { recursive: true, force: true });
+  await writeSessionLog(fixture, { sessionId: OWNER, cwd: elsewhere });
+  const conflicted = await auditLegacyRooms({ root: alias, dshHome: fixture.dshHome, now: NOW });
+  const conflictedRoom = roomOf(conflicted);
+  assert.equal(conflictedRoom.members[0].cwdMatches, false);
+  assert.equal(conflictedRoom.reason, LEGACY_REASON.CWD_MISMATCH);
+  assert.equal(conflictedRoom.classification, LEGACY_CLASSIFICATION.AMBIGUOUS);
 });

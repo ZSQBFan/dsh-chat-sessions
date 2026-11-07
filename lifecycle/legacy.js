@@ -18,14 +18,23 @@
  *     标题链接，把它当硬证据会让首次升级永远无法迁移；严格模式传
  *     `linksAreAdoptionEvidence: true`。
  *  4. 绝不因为审计而删除/重建目录：空目录、已归档空目录都是候选，`preserve` 恒为 true。
- *  5. 路径判定分两层：`canonicalCwd` 用 model.canonicalPath（仅 resolve，与成员分类口径
- *     一致）；`realPath` 用 realpath，只用于「软链接是否越出 root」与目录身份核对。
+ *  5. 路径判定分三层：`canonicalCwd` 用 model.canonicalPath（仅 resolve，作为对外展示的
+ *     拼写）；`canonical 身份`（realpath 优先，不可达退回 model.canonicalPath）用于成员
+ *     cwd 比较、root 边界与 scope 身份——祖先 symlink、`..`、末尾斜杠、大小写差异都不得
+ *     让同一个目录分裂成两个；`realPath` 是房间目录的 realpath，用于越出 root 判定与
+ *     目录身份核对。
+ *  6. scope 身份只认 `scopeIdentity` 指向的那一份账本目录（plugin + profile +
+ *     realpath(dshHome) + realpath(root)，与 `LedgerStore.open()` 同源）。别的 root 或
+ *     profile 的账本只说明别的 scope 迁移过，**不得**被当成本 scope 的「账本已存在」而把
+ *     首次升级的旧房间从 adoptable 降级。
  *
  * 契约（本文件对外的唯一接口）：
  *
  *   auditLegacyRooms({
  *     root,                     // 必填，插件 chatRoot()，即 <...>/chats
  *     dshHome,                  // 可空，缺省 DSH_HOME 或 ~/.dsh
+ *     profileId,                // 可空，缺省与 LedgerStore 同源（DEFAULT_PROFILE_ID）
+ *     pluginId,                 // 可空，缺省与 LedgerStore 同源（DEFAULT_PLUGIN_ID）
  *     now,                      // 可空，时间戳（写入 generatedAt）
  *     recordedIdentities,       // 可空，{ [目录路径]: {dev, ino} } 或 [{path, dev, ino}]
  *     linksAreAdoptionEvidence, // 可空，默认 false（见不变量 3）
@@ -70,6 +79,7 @@ import {
   canonicalPath,
   classifyDirectory,
   classifyMember,
+  scopeIdentity,
 } from './model.js';
 import { effectiveDshHome } from './store.js';
 
@@ -228,6 +238,20 @@ function pathVariants(...paths) {
     if (path.endsWith(sep) && path.length > 1) set.add(canonicalPath(path.slice(0, -sep.length)));
   }
   return [...set];
+}
+
+/**
+ * 目录的 canonical 身份：realpath 优先（抹平祖先 symlink、`..`、末尾斜杠与大小写差异），
+ * 路径不可达时退回 model.canonicalPath。成员 cwd 比较、root 边界与 scope 身份都用这一份
+ * 口径，且与 `LedgerStore.open()` 的 realpath 归一保持一致。
+ * @param {unknown} path 待归一的目录路径。
+ * @returns {Promise<string|null>} 归一后的绝对路径；空输入返回 null。
+ */
+async function canonicalIdentity(path) {
+  if (!isNonEmptyString(path)) return null;
+  const resolved = canonicalPath(path);
+  const real = await realpath(resolved).then(canonicalPath, () => null);
+  return real ?? resolved;
 }
 
 /** 从目录里挑出会话日志文件名：版本号大者优先，zstd 与明文一视同仁。 */
@@ -459,13 +483,21 @@ function normalizeRegistry(snapshot, diagnostics) {
 // ── 探测器：scope 级账本状态 ──────────────────────────────────────────────────
 
 /**
- * 扫 `<dshHome>/storages/dsh-chat-sessions-lifecycle/<scopeId>/`，只读判断：
- *  - `ledgerExists`：任意 scope 有 ledger.json（迁移已走过，本审计不接管）；
+ * 读**当前 scope** 的账本目录 `<dshHome>/storages/dsh-chat-sessions-lifecycle/<scopeId>/`，
+ * 只读判断：
+ *  - `ledgerExists`：本 scope 有 ledger.json（迁移已走过，本审计不接管）；
  *  - `migrationCompleted`：migration.json 或 ledger.migration.completed 为 true；
  *  - `residue`：存在 quarantine/ 或 migration.json（曾经有过账本/迁移动作）；
  *  - `weakResidue`：只有 lock.json（可能是首次启动崩溃，不能单独当「曾被 adopt」）。
+ *
+ * `scopeId` 由调用方按 `scopeIdentity` 算好（plugin + profile + realpath(dshHome) +
+ * realpath(root)，与 `LedgerStore.open()` 同源）。同一 DSH_HOME 下别的 root/profile 的
+ * scope 目录**一律不看**：那些账本只说明别的 scope 迁移过，不能拿来阻断本 scope 的首次
+ * 升级（OW-11）。
+ * @param {{dshHome: string, scopeId: string|null, diagnostics: object[]}} options
+ * @returns {Promise<object>} scope 状态。
  */
-async function readScopeStateFromDisk({ dshHome, diagnostics }) {
+async function readScopeStateFromDisk({ dshHome, scopeId, diagnostics }) {
   const state = {
     ledgerExists: false,
     migrationCompleted: false,
@@ -473,44 +505,34 @@ async function readScopeStateFromDisk({ dshHome, diagnostics }) {
     weakResidue: false,
     migrationSources: [],
   };
-  const base = join(dshHome, 'storages', LEDGER_STORAGE_DIRNAME);
-  let scopes = [];
+  if (!isNonEmptyString(scopeId)) return state;
+  const directory = join(dshHome, 'storages', LEDGER_STORAGE_DIRNAME, scopeId);
+  let names = [];
   try {
-    scopes = await readdir(base, { withFileTypes: true });
+    names = await readdir(directory);
   } catch (error) {
     if (error?.code !== 'ENOENT') {
-      diagnostics.push({ code: LEGACY_DIAGNOSTIC.SCOPE_UNREADABLE, path: base, detail: String(error?.code ?? error) });
+      diagnostics.push({ code: LEGACY_DIAGNOSTIC.SCOPE_UNREADABLE, path: directory, detail: String(error?.code ?? error) });
     }
     return state;
   }
-  for (const scope of scopes) {
-    if (!scope.isDirectory()) continue;
-    const directory = join(base, scope.name);
-    let names = [];
-    try {
-      names = await readdir(directory);
-    } catch (error) {
-      diagnostics.push({ code: LEGACY_DIAGNOSTIC.SCOPE_UNREADABLE, path: directory, detail: String(error?.code ?? error) });
-      continue;
-    }
-    if (names.includes(LEDGER_FILE)) {
-      state.ledgerExists = true;
-      state.migrationSources.push(join(directory, LEDGER_FILE));
-      const ledger = await readJsonFile(join(directory, LEDGER_FILE));
-      if (ledger?.migration?.completed === true) state.migrationCompleted = true;
-    }
-    if (names.includes(MIGRATION_FILE)) {
-      state.residue = true;
-      state.migrationSources.push(join(directory, MIGRATION_FILE));
-      const migration = await readJsonFile(join(directory, MIGRATION_FILE));
-      if (migration?.completed === true) state.migrationCompleted = true;
-    }
-    if (names.includes(QUARANTINE_DIR)) {
-      state.residue = true;
-      state.migrationSources.push(join(directory, QUARANTINE_DIR));
-    }
-    if (names.includes(LOCK_FILE)) state.weakResidue = true;
+  if (names.includes(LEDGER_FILE)) {
+    state.ledgerExists = true;
+    state.migrationSources.push(join(directory, LEDGER_FILE));
+    const ledger = await readJsonFile(join(directory, LEDGER_FILE));
+    if (ledger?.migration?.completed === true) state.migrationCompleted = true;
   }
+  if (names.includes(MIGRATION_FILE)) {
+    state.residue = true;
+    state.migrationSources.push(join(directory, MIGRATION_FILE));
+    const migration = await readJsonFile(join(directory, MIGRATION_FILE));
+    if (migration?.completed === true) state.migrationCompleted = true;
+  }
+  if (names.includes(QUARANTINE_DIR)) {
+    state.residue = true;
+    state.migrationSources.push(join(directory, QUARANTINE_DIR));
+  }
+  if (names.includes(LOCK_FILE)) state.weakResidue = true;
   return state;
 }
 
@@ -610,9 +632,29 @@ export async function auditLegacyRooms(options = {}) {
   const sessionsRoot = canonicalPath(join(root, '.sessions'));
   const dshHome = canonicalPath(effectiveDshHome(options.dshHome));
 
-  // 真实边界：root 自身可能是软链接，边界比较一律用 realpath。
+  // 真实边界：root 自身可能是软链接，边界比较一律用 canonical 身份（realpath 优先）。
   const realRoot = await realpath(root).then(canonicalPath, () => null);
+  const rootIdentity = realRoot ?? root;
   const realSessionsRoot = realRoot === null ? null : canonicalPath(join(realRoot, '.sessions'));
+  const sessionsRootIdentity = realSessionsRoot ?? sessionsRoot;
+
+  // scope 身份与 `LedgerStore.open()` 同源：dshHome 与 root 都先 realpath（失败退回
+  // resolve）。否则 macOS 上 /var → /private/var 这种差异会让审计找不到自己的账本。
+  const realDshHome = await realpath(dshHome).then(canonicalPath, () => null);
+  const scopeHome = realDshHome ?? dshHome;
+  const scopeId = isNonEmptyString(scopeHome)
+    ? scopeIdentity({
+        pluginId: options.pluginId,
+        profileId: options.profileId,
+        dshHome: scopeHome,
+        canonicalRoot: rootIdentity,
+      })
+    : null;
+
+  // 归属判定：别名拼写（root）与真实拼写（rootIdentity）任一口径命中即算在 root 内。
+  // 目录已不存在时只能靠字符串口径，两边都试才不会把 root 内的登记误判成 root 外。
+  const underRoot = (path) => isUnder(rootIdentity, path) || isUnder(root, path);
+  const underSessionsRoot = (path) => isUnder(sessionsRootIdentity, path) || isUnder(sessionsRoot, path);
 
   const headerReader = createHeaderReader({ dshHome, diagnostics });
   const recordedIdentities = normalizeRecordedIdentities(options.recordedIdentities);
@@ -692,7 +734,7 @@ export async function auditLegacyRooms(options = {}) {
       diagnostics.push({ code: LEGACY_DIAGNOSTIC.SCOPE_UNREADABLE, detail: String(error?.code ?? error) });
     }
   }
-  scopeState ??= await readScopeStateFromDisk({ dshHome, diagnostics });
+  scopeState ??= await readScopeStateFromDisk({ dshHome: scopeHome, scopeId, diagnostics });
 
   // ③ 链接索引（标题入口 / 归档入口）——只作佐证
   const links = await readLinksFile(root, diagnostics);
@@ -719,7 +761,7 @@ export async function auditLegacyRooms(options = {}) {
     if (direct !== undefined) return direct;
     for (const workspace of registry.workspaces) {
       const resolved = canonicalPath(workspace.path);
-      if (!isUnder(root, resolved)) continue;
+      if (!underRoot(resolved)) continue;
       const real = await realpath(resolved).then(canonicalPath, () => null);
       if (real !== null && realPath !== null && real === realPath) return workspace;
     }
@@ -730,14 +772,16 @@ export async function auditLegacyRooms(options = {}) {
   async function classify({ sessionId, record, canonicalCwd, realPath, workspaceId, claims }) {
     const memberHeader = record.header;
     const subagent = isSubagentHeader(memberHeader);
-    // 路径拼写可能不同（祖先软链接），resolve 口径不同时再用 realpath 兜底。
+    // 成员 cwd 与房间目录只比 canonical 身份：先走字符串快路径（同一拼写），不同再
+    // realpath 归一。祖先 symlink、`..`、末尾斜杠都不该把同一个目录分裂成两个。
     let cwdMatches = false;
     if (memberHeader !== null) {
       if (canonicalPath(memberHeader.cwd) === canonicalCwd) {
         cwdMatches = true;
-      } else if (realPath !== null) {
-        const headerReal = await realpath(memberHeader.cwd).then(canonicalPath, () => null);
-        cwdMatches = headerReal !== null && headerReal === realPath;
+      } else {
+        const headerIdentity = await canonicalIdentity(memberHeader.cwd);
+        const roomIdentity = realPath ?? (await canonicalIdentity(canonicalCwd));
+        cwdMatches = headerIdentity !== null && headerIdentity === roomIdentity;
       }
     }
     const eligibility =
@@ -749,7 +793,9 @@ export async function auditLegacyRooms(options = {}) {
             ? classifyMember({
                 header: memberHeader,
                 isSubagent: false,
-                canonicalCwd,
+                // cwd 等值已按 canonical 身份确认；这里传 header 自己的拼写，避免
+                // classifyMember 再用未 realpath 的字符串比较二次裁决（OW-13）。
+                canonicalCwd: memberHeader.cwd,
                 workspaceId,
                 claimedBy: claims.get(sessionId) ?? null,
               })
@@ -851,6 +897,8 @@ export async function auditLegacyRooms(options = {}) {
 
     // 软链接旁路（root 自身是软链接时 canonicalCwd 与 realPath 不同，边界仍按 realpath）
     const realPath = await realpath(path).then(canonicalPath, () => null);
+    // 别名 root：真实身份同样算「已处理」，否则同一条登记的另一种拼写会被当成缺失房间。
+    if (realPath !== null) handled.add(realPath);
     const workspace = await findWorkspace(canonicalCwd, realPath);
     const workspaceId = workspace?.id ?? null;
     const registrySessionIds = workspace?.sessionIds ?? [];
@@ -1058,15 +1106,18 @@ export async function auditLegacyRooms(options = {}) {
   let registryRoomMissingReported = 0;
   for (const workspace of registry.workspaces) {
     const resolved = canonicalPath(workspace.path);
-    if (!isUnder(root, resolved)) {
+    // root 可能是别名软链接：登记路径多半是真实路径，字符串口径判不出归属时再走
+    // canonical 身份；两种拼写都不该让 root 内的登记变成 root 外。
+    const identity = underRoot(resolved) ? resolved : ((await canonicalIdentity(resolved)) ?? resolved);
+    if (!underRoot(identity)) {
       registryOutsideRoot += 1;
       continue;
     }
-    if (handled.has(resolved)) continue;
-    if (isUnder(sessionsRoot, resolved)) {
+    if (handled.has(resolved) || handled.has(identity)) continue;
+    if (underSessionsRoot(identity)) {
       // `.sessions/<id>` 有登记但磁盘上没有这个目录：不造房间，只计数 + 有限诊断。
       registryRoomMissing += 1;
-      const sessionId = resolved.slice(resolved.lastIndexOf(sep) + 1);
+      const sessionId = identity.slice(identity.lastIndexOf(sep) + 1);
       if (registry.archivedSessionIds.has(sessionId)) {
         registryRoomMissingArchived += 1;
         continue;
