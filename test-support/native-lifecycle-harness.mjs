@@ -111,6 +111,7 @@ async function findWorkspaceAt(workspaces, cwd) {
   return undefined;
 }
 
+var result = {ok: false, checks: [], steps, evidence: {}};
 function check(name, condition, detail) {
   result.checks.push({name, pass: condition === true, detail});
   if (condition !== true) result.ok = false;
@@ -207,10 +208,11 @@ try {
     await new Promise((resolve) => setTimeout(resolve, 150));
   }
   check('enable-restored-ready', restored !== null, {state: restored?.lifecycle?.state});
-  const roomArchived = registry.list().find((entity) => entity.path === archivedCwd);
-  const roomPinned = registry.list().find((entity) => entity.path === pinnedCwd);
-  check('enable-registers-room', roomArchived !== undefined, {room: roomArchived?.id ?? null});
-  check('enable-registers-second-room', roomPinned !== undefined, {room: roomPinned?.id ?? null});
+  const registryAfterEnable = registry.list();
+  const roomArchived = await findWorkspaceAt(registryAfterEnable, archivedCwd);
+  const roomPinned = await findWorkspaceAt(registryAfterEnable, pinnedCwd);
+  check('enable-registers-room', roomArchived !== undefined, {room: roomArchived?.id ?? null, registry: registryAfterEnable.map((entity) => ({id: entity.id, path: entity.path, sessionIds: entity.sessionIds}))});
+  check('enable-registers-second-room', roomPinned !== undefined, {room: roomPinned?.id ?? null, registry: registryAfterEnable.map((entity) => ({id: entity.id, path: entity.path, sessionIds: entity.sessionIds}))});
   check('enable-attaches-session', roomArchived?.sessionIds?.includes(archivedId) === true, {members: roomArchived?.sessionIds});
   check('enable-restores-shared-member', roomArchived?.sessionIds?.includes(sharedId) === true,
     {members: roomArchived?.sessionIds, sharedId});
@@ -227,7 +229,7 @@ try {
     await hmr.runExclusive(() => hmr.reconcileProfile());
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
-  const stillSame = registry.list().find((entity) => entity.path === archivedCwd);
+  const stillSame = await findWorkspaceAt(registry.list(), archivedCwd);
   check('hmr-keeps-workspace-id', stillSame !== undefined && stillSame.id === keptId, {before: keptId, after: stillSame?.id});
 
   // ── 原生卸载（bundle remove）：可选阶段，`LC_NATIVE_REMOVE=1` 打开 ──

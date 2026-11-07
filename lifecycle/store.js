@@ -161,6 +161,7 @@ export class LedgerStore {
   #directoryFsync = 'unknown';
   #queue = Promise.resolve();
   #closed = false;
+  #recoveryState = 'clean';
 
   /**
    * 打开（或初始化）一个 scope 的账本。
@@ -229,6 +230,11 @@ export class LedgerStore {
     return this.#status;
   }
 
+  /** `clean | pending | recovering | blocked`；启动恢复未完成时禁止上层宣告 READY。 */
+  get recoveryState() {
+    return this.#recoveryState;
+  }
+
   /** 只读诊断副本；`invalid` 时至少一条。 */
   get diagnostics() {
     return this.#diagnostics.map((entry) => ({ ...entry }));
@@ -271,6 +277,9 @@ export class LedgerStore {
     if (typeof mutator !== 'function') throw new TypeError('update 需要 mutator 函数');
     if (this.#closed) throw new LedgerWriteError('账本 store 已关闭');
     if (this.#status === 'invalid') throw this.#invalidError();
+    if (this.#recoveryState === 'blocked') {
+      throw new LedgerWriteError('账本历史恢复已阻塞，需人工诊断后继续', {code: REASON.RECOVERY_BLOCKED});
+    }
     const run = () => this.#updateExclusive(mutator);
     const result = this.#queue.then(run, run);
     // 队列吞掉上一次的失败，避免一个被拒绝的 update 卡死后续写入。
@@ -621,6 +630,7 @@ export class LedgerStore {
         const generation = Number(state.generation);
         const revision = Number(state.revision);
         if (state.scopeId !== this.#scopeId
+          || scopeIdentity(state.identity) !== this.#scopeId
           || !Number.isSafeInteger(generation)
           || !Number.isSafeInteger(revision)
           || Number(entry.generation) !== generation
@@ -718,11 +728,14 @@ export class LedgerStore {
     if (newest === null) return;
     const current = this.#state;
     if (current !== null && compareCommit(newest, commitOf(current)) <= 0) return;
+    this.#recoveryState = 'pending';
     let token;
     try { token = await this.#acquireRecoveryLock(); } catch (error) {
-      this.#diagnostics.push({code: WRITE_ERROR_CODE.LOCK_LOST, message: `启动历史对账未取得锁: ${error.message}`});
+      this.#recoveryState = 'blocked';
+      this.#diagnostics.push({code: REASON.RECOVERY_BLOCKED, message: `启动历史对账未取得锁: ${error.message}`});
       return;
     }
+    this.#recoveryState = 'recovering';
     const heartbeat = this.#startLeaseHeartbeat(token);
     try {
       await this.#reload();
@@ -738,9 +751,11 @@ export class LedgerStore {
       });
       const raw = await readFile(this.#path);
       await this.#adopt(raw);
+      this.#recoveryState = 'clean';
       this.#diagnostics.push({code: WRITE_ERROR_CODE.LOCK_LOST, message: `启动对账：按历史恢复到 generation=${newest.generation}, revision=${newest.revision}`});
     } catch (error) {
-      this.#diagnostics.push({code: REASON.LEDGER_WRITE_FAILED, message: `启动历史对账失败，账本保持原样: ${error.message}`});
+      this.#recoveryState = 'blocked';
+      this.#diagnostics.push({code: REASON.RECOVERY_BLOCKED, message: `启动历史对账失败，账本保持原样: ${error.message}`});
     } finally {
       this.#stopLeaseHeartbeat(heartbeat);
       await heartbeat.settled;

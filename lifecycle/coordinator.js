@@ -234,6 +234,10 @@ export class LifecycleCoordinator {
    */
   async start() {
     const ledger = await this.#read();
+    if (this.#store.recoveryState === 'blocked') {
+      this.degrade(REASON.RECOVERY_BLOCKED, '账本历史恢复未完成，禁止开放生命周期写入口');
+      return {ok: false, blocked: REASON.RECOVERY_BLOCKED};
+    }
     if (this.#store.status === 'invalid') {
       this.#state = PROCESS_STATE.DEGRADED;
       return {ok: false, blocked: REASON.LEDGER_INVALID};

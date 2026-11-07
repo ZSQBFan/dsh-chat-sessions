@@ -103,6 +103,20 @@ export async function describeUnload(ctx, {moduleName = PACKAGE_NAME} = {}) {
     return {reason: UNLOAD.UNKNOWN, managerAvailable: true, detail: hostError('list-plugins', error)};
   }
 
+  const bundle = (Array.isArray(bundles) ? bundles : []).find((entry) => {
+    if (entry?.name === moduleName) return true;
+    if (Array.isArray(entry?.rows) && entry.rows.some((row) => isOwnRow(row, moduleName))) return true;
+    return String(entry?.source ?? '').includes(moduleName);
+  });
+  // removeBundle 的 disposer 可能先于 plugin row 清理执行；bundle 已消失时，
+  // own row 仍可能短暂保留 enabled:true，包状态优先于插件行状态。
+  if (bundle === undefined && Array.isArray(bundles)) {
+    return {reason: UNLOAD.BUNDLE_REMOVE, managerAvailable: true, detail: {why: 'bundle-absent'}};
+  }
+  if (bundle?.enabled === false) {
+    return {reason: UNLOAD.BUNDLE_DISABLE, managerAvailable: true, detail: {bundle: bundle.name ?? null}};
+  }
+
   const own = (Array.isArray(rows) ? rows : []).filter((row) => isOwnRow(row, moduleName));
   if (own.length > 0) {
     const disabled = own.every((row) => row?.enabled === false);
@@ -113,16 +127,8 @@ export async function describeUnload(ctx, {moduleName = PACKAGE_NAME} = {}) {
     };
   }
 
-  const bundle = (Array.isArray(bundles) ? bundles : []).find((entry) => {
-    if (entry?.name === moduleName) return true;
-    if (Array.isArray(entry?.rows) && entry.rows.some((row) => isOwnRow(row, moduleName))) return true;
-    return String(entry?.source ?? '').includes(moduleName);
-  });
   if (bundle === undefined) {
     return {reason: UNLOAD.BUNDLE_REMOVE, managerAvailable: true, detail: {why: 'bundle-absent'}};
-  }
-  if (bundle.enabled === false) {
-    return {reason: UNLOAD.BUNDLE_DISABLE, managerAvailable: true, detail: {bundle: bundle.name ?? null}};
   }
   return {reason: UNLOAD.UNKNOWN, managerAvailable: true, detail: {why: 'rows-absent-bundle-enabled'}};
 }

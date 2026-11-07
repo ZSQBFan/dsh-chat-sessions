@@ -818,10 +818,30 @@ test('12. history recovery validates scope and revision, and never replaces a ne
   await writeFile(store.path, `${JSON.stringify(newer)}\n`);
   const invalid = {...newer, schemaVersion: 999, generation: 999, revision: 999};
   const foreign = {...newer, scopeId: 'f'.repeat(32), generation: 1000, revision: 1000};
-  await writeFile(historyPath, `${JSON.stringify({generation: invalid.generation, revision: invalid.revision, state: invalid})}\n${JSON.stringify({generation: foreign.generation, revision: foreign.revision, state: foreign})}\n`);
+  const forgedIdentity = {...newer, generation: 1001, revision: 1001, identity: {...newer.identity, pluginId: 'foreign-plugin'}};
+  await writeFile(historyPath, `${JSON.stringify({generation: invalid.generation, revision: invalid.revision, state: invalid})}\n${JSON.stringify({generation: foreign.generation, revision: foreign.revision, state: foreign})}\n${JSON.stringify({generation: forgedIdentity.generation, revision: forgedIdentity.revision, state: forgedIdentity})}\n`);
   const stable = await openStore(workspace);
   const stableState = await stable.read();
   assert.equal(stableState.generation, 3, 'invalid/foreign history must not overwrite a valid ledger');
   assert.equal(stableState.revision, 4);
   assert.equal(stable.status, 'ready');
+});
+
+
+test('13. history recovery lock-held blocks lifecycle writes instead of reporting ready', async (t) => {
+  const workspace = await makeWorkspace(t);
+  const store = await openStore(workspace);
+  await store.update((state) => { state.generation = 1; });
+  const baseline = JSON.parse(await readFile(store.path, 'utf8'));
+  const historyPath = join(dirname(store.path), 'history.jsonl');
+  const lockPath = join(dirname(store.path), 'lock.json');
+  const newer = {...baseline, generation: 2, revision: 2};
+  await writeFile(historyPath, `${JSON.stringify({phase: 'committed', generation: 2, revision: 2, state: newer})}\n`);
+  await writeFile(lockPath, JSON.stringify({token: 'live-owner', pid: 1, hostname: 'test', createdAt: new Date().toISOString(), leaseExpiresAt: new Date(Date.now() + 60_000).toISOString()}));
+
+  const blocked = await openStore(workspace, {leaseMs: 1_000});
+  assert.equal(blocked.status, 'ready', '原账本仍可读，但恢复状态必须单独暴露');
+  assert.equal(blocked.recoveryState, 'blocked');
+  assert.equal(blocked.diagnostics.some((entry) => entry.code === 'RECOVERY_BLOCKED'), true);
+  await assert.rejects(blocked.update((state) => { state.generation = 3; }), (error) => error.code === 'RECOVERY_BLOCKED');
 });
