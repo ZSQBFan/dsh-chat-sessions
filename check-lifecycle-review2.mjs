@@ -9,9 +9,9 @@
 //   · 同 cwd 子代理 → 不补账、不恢复；
 //   · PARTIAL → 下一次启动继续补齐，不把用户已收编的会话抢回来。
 import assert from 'node:assert/strict';
-import { mkdir, mkdtemp, readFile, realpath } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test from 'node:test';
 
 import { ELIGIBILITY, PROCESS_STATE, ROOM_STATE } from './lifecycle/model.js';
@@ -35,6 +35,7 @@ async function open({ host, home, root, failAt = 0 }) {
   let updates = 0;
   const wrapper = {
     get status() { return store.status; },
+    get recoveryState() { return store.recoveryState; },
     read: () => store.read(),
     close: () => store.close(),
     async update(mutator) {
@@ -290,6 +291,33 @@ test('R2-F08 PARTIAL：下一次启动继续补齐缺失成员', async () => {
     const described = await coordinator.describe();
     assert.deepEqual([...described.managed.sessionIds].sort(), [owner, missing].sort());
     await coordinator.close();
+  } finally {
+    await host.close();
+  }
+});
+
+
+test('R2-F09 启动 history 恢复锁忙：协调器必须 DEGRADED，不得宣告 READY', async () => {
+  const {home, root, host} = await sandbox();
+  try {
+    const seeded = await LedgerStore.open({dshHome: home, canonicalRoot: root, profileId: 'review-2'});
+    await seeded.update((state) => { state.generation = 1; });
+    const baseline = JSON.parse(await readFile(seeded.path, 'utf8'));
+    const historyPath = join(dirname(seeded.path), 'history.jsonl');
+    const lockPath = join(dirname(seeded.path), 'lock.json');
+    const newer = {...baseline, generation: Number(baseline.generation) + 1, revision: Number(baseline.revision) + 1};
+    await writeFile(historyPath, `${JSON.stringify({phase: 'committed', generation: 2, revision: 2, state: newer})}\n`);
+    await writeFile(lockPath, JSON.stringify({token: 'live-owner', pid: 1, hostname: 'test', createdAt: new Date().toISOString(), leaseExpiresAt: new Date(Date.now() + 60_000).toISOString()}));
+    await seeded.close();
+
+    const opened = await open({host, home, root});
+    assert.equal(opened.store.recoveryState, 'blocked');
+    const started = await opened.coordinator.start();
+    assert.equal(started.ok, false, JSON.stringify(started));
+    assert.ok(['RECOVERY_BLOCKED', 'LOCK_HELD'].includes(started.blocked), JSON.stringify(started));
+    assert.equal(opened.coordinator.state, PROCESS_STATE.DEGRADED);
+    assert.equal(opened.coordinator.canWrite(), false);
+    await opened.coordinator.close();
   } finally {
     await host.close();
   }
