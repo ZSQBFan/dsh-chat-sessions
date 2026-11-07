@@ -226,9 +226,15 @@ export async function createWorkspace(ctx, path, title) {
 
 /**
  * 把成员挂回工作区。逐个成员单独判定，失败只影响该成员。
+ *
+ * 宿主没有「条件挂接」入口，所以每挂一个之前先跑调用方的 `verify(sessionId)`（重新读原生
+ * 快照，确认这个会话还没被别人认领、目标工作区仍是同一个）。`verify` 返回 false 时该成员
+ * 记为失败而不是硬挂上去。
+ * @param {{verify?: (sessionId: string) => Promise<boolean>}} [options]
  * @returns {Promise<{attached: string[], failed: Array<{sessionId: string, error: object}>, missing: boolean}>}
  */
-export async function attachSessions(ctx, workspaceId, sessionIds) {
+export async function attachSessions(ctx, workspaceId, sessionIds, options = {}) {
+  const verify = typeof options.verify === 'function' ? options.verify : null;
   const registry = service(ctx, 'workspaceRegistry');
   const attached = [];
   const failed = [];
@@ -237,6 +243,10 @@ export async function attachSessions(ctx, workspaceId, sessionIds) {
   }
   for (const sessionId of sessionIds) {
     try {
+      if (verify !== null && (await verify(sessionId)) === false) {
+        failed.push({sessionId, error: {action: 'attach', code: 'ATTACH_PRECONDITION_FAILED', message: 'member or workspace changed before attach'}});
+        continue;
+      }
       const entity = await registry.get(workspaceId);
       if (entity === undefined || entity === null) return {attached, failed, missing: true};
       if (Array.isArray(entity.sessionIds) && entity.sessionIds.includes(sessionId)) {

@@ -21,12 +21,14 @@ import {
   PROCESS_STATE,
   REASON,
   ROOM_STATE,
+  canonicalPath,
   classifyDirectory,
   classifyMember,
   createLedger,
   roomTransition,
   summarizeRooms,
 } from './model.js';
+import {auditLegacyRooms, legacyRoomDraft} from './legacy.js';
 import {
   DETACH_REASONS,
   HOST_CAPABILITY,
@@ -51,6 +53,21 @@ function toErrorRecord(phase, error, reason = REASON.ATTACH_FAILED) {
   };
 }
 
+/**
+ * 从 header 里取 cwd。
+ *
+ * `host-adapter.readSessionHeader()` 返回的是**裸 header**（宿主 `persistence.stat()` 的 `header` 字段）；
+ * 历史调用方还写过 `{ok, header}` 包装。这里两种都认，避免因为形状不一致把同房间的派生会话
+ * 误判成外来成员（验收 F01）。
+ * @param {object|null|undefined} header
+ * @returns {string|undefined}
+ */
+function headerCwd(header) {
+  if (header === null || header === undefined || typeof header !== 'object') return undefined;
+  const raw = header.ok !== undefined && header.header !== undefined ? header.header : header;
+  return typeof raw?.cwd === 'string' ? raw.cwd : undefined;
+}
+
 /** 目录 dev/ino 身份；拿不到就记 null，由 `classifyDirectory` 放行（不做伪否决）。 */
 function directoryIdentityOf(stat) {
   if (stat === null || stat === undefined) return null;
@@ -68,7 +85,7 @@ function roomRecord({ownerSessionId, cwd, canonicalCwd, directoryIdentity, works
     state: ROOM_STATE.MANAGED,
     sessionIds: ownerSessionId === '' ? [] : [ownerSessionId],
     operation: null,
-    members: ownerSessionId === '' ? [] : [{sessionId: ownerSessionId, eligibility: ELIGIBILITY.ELIGIBLE}],
+    members: ownerSessionId === '' ? [] : [{sessionId: ownerSessionId, eligibility: ELIGIBILITY.ATTACHED}],
     lastError: null,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -86,17 +103,25 @@ export class LifecycleCoordinator {
   #frozen = false;
   #lastDetach = null;
   #diagnostics = [];
+  #identity;
   #log;
 
   /**
    * @param {{ctx: object, config?: object, store: object, log?: Function, clock?: () => number}} options
    */
-  constructor({ctx, config = {}, store, log = () => {}, clock = () => Date.now()}) {
+  constructor({ctx, config = {}, store, identity = {}, log = () => {}, clock = () => Date.now()}) {
     this.#ctx = ctx;
     this.#config = config;
     this.#store = store;
     this.#clock = clock;
     this.#log = log;
+    // 旧数据迁移要用与账本同源的 scope 身份（root / profile / DSH_HOME），不能用端口或时间冒充。
+    this.#identity = {
+      root: identity.root ?? config.root ?? '',
+      profileId: identity.profileId ?? 'unknown-profile',
+      dshHome: identity.dshHome ?? '',
+      pluginId: identity.pluginId ?? 'dsh-chat-sessions',
+    };
   }
 
   get state() {
@@ -166,6 +191,31 @@ export class LifecycleCoordinator {
   }
 
   /**
+   * 关键路径写账本：失败时必须让调用方知道，不能像 `#update` 那样返回 null 了事。
+   * @returns {Promise<{ok: boolean, code?: string, message?: string}>}
+   */
+  async #updateRequired(mutator) {
+    try {
+      await this.#store.update(mutator);
+      return {ok: true};
+    } catch (error) {
+      const code = error?.code === 'LOCK_HELD' ? 'LOCK_HELD' : (typeof error?.code === 'string' && error.code !== '' ? error.code : 'LEDGER_WRITE_FAILED');
+      this.#diagnostics.push({code, message: String(error?.message ?? error).slice(0, 300)});
+      return {ok: false, code, message: String(error?.message ?? error).slice(0, 300)};
+    }
+  }
+
+  /**
+   * 元数据不可靠时停止自动写：进程状态降到 DEGRADED，`canWrite()` 随之为 false。
+   * 已接收的请求按各自语义回报失败，不假装成功（验收 F04 / R16）。
+   */
+  degrade(code = REASON.LEDGER_WRITE_FAILED, message = '') {
+    this.#state = PROCESS_STATE.DEGRADED;
+    this.#frozen = false;
+    this.#diagnostics.push({code, message: String(message).slice(0, 300)});
+  }
+
+  /**
    * 启动：开账本 → 对账 creation intent → 恢复上次未完成的交接/恢复 → 开放写入口。
    * @returns {Promise<{ok: boolean, summary?: object, blocked?: string}>}
    */
@@ -178,16 +228,33 @@ export class LifecycleCoordinator {
     this.#generation = ledger?.generation ?? 0;
     this.#lastDetach = ledger?.process?.lastDetach ?? null;
 
+    const migration = await this.#migrateLegacy(ledger);
     const reconcile = await this.#reconcileCreationIntents(ledger);
     const restore = await this.#restore(ledger);
+    const summary = {...migration, ...reconcile, ...restore, rooms: summarizeRooms(ledger?.rooms ?? [])};
 
-    await this.#update((state) => {
+    // 恢复阶段读不到原生登记 / 写不进账本时不能对外宣告 READY：那会让插件在没有恢复依据的
+    // 情况下继续接受新建与复用（验收 K04 / R07）。
+    if (restore.blocked !== undefined) {
+      this.#state = PROCESS_STATE.DEGRADED;
+      await this.#update((state) => {
+        state.process = {...(state.process ?? {}), state: PROCESS_STATE.DEGRADED, lastDetach: this.#lastDetach};
+        state.generation = this.#generation;
+      });
+      return {ok: false, blocked: restore.blocked, summary};
+    }
+
+    const ready = await this.#updateRequired((state) => {
       state.process = {...(state.process ?? {}), state: PROCESS_STATE.READY, lastDetach: this.#lastDetach};
       state.generation = this.#generation;
     });
+    if (ready.ok === false) {
+      this.#state = PROCESS_STATE.DEGRADED;
+      return {ok: false, blocked: ready.code ?? REASON.LEDGER_WRITE_FAILED, summary};
+    }
 
     this.#state = PROCESS_STATE.READY;
-    return {ok: true, summary: {...reconcile, ...restore, rooms: summarizeRooms(ledger?.rooms ?? [])}};
+    return {ok: true, summary};
   }
 
   /**
@@ -202,7 +269,8 @@ export class LifecycleCoordinator {
     if (!this.canWrite()) return {ok: false, code: 'LIFECYCLE_NOT_READY'};
     const canonical = canonicalCwd ?? cwd;
     const intentId = `intent-${sessionId}`;
-    const result = await this.#update((state) => {
+    // 意图必须真的落盘：写不进去就不许再建原生对象（验收 F04 / R10）。
+    const result = await this.#updateRequired((state) => {
       state.creationIntents = (state.creationIntents ?? []).filter((entry) => entry.id !== intentId);
       state.creationIntents.push({
         id: intentId,
@@ -215,13 +283,15 @@ export class LifecycleCoordinator {
         createdAt: new Date().toISOString(),
       });
     });
-    return {ok: result !== null, intentId};
+    if (result.ok === false) return {ok: false, code: result.code, intentId};
+    return {ok: true, intentId};
   }
 
   /** 原生对象建成后收尾：登记房间并把意图标成 ADOPTED。 */
   async finishCreate({sessionId, cwd, canonicalCwd, workspaceId, directoryIdentity}) {
     const canonical = canonicalCwd ?? cwd;
-    const result = await this.#update((state) => {
+    // 收尾写失败不能静默：意图保留在账本里，调用方据此把进程切 DEGRADED 并如实回报。
+    const result = await this.#updateRequired((state) => {
       state.creationIntents = (state.creationIntents ?? []).filter((entry) => entry.sessionId !== sessionId);
       const rooms = Array.isArray(state.rooms) ? state.rooms : [];
       const index = rooms.findIndex((room) => room.workspaceId === workspaceId);
@@ -230,7 +300,8 @@ export class LifecycleCoordinator {
       else rooms[index] = {...rooms[index], ...room, state: ROOM_STATE.MANAGED, lastError: null};
       state.rooms = rooms;
     });
-    return {ok: result !== null};
+    if (result.ok === false) return {ok: false, code: result.code};
+    return {ok: true};
   }
 
   /** 原生创建失败：把意图删掉，不留半条记录。 */
@@ -238,6 +309,95 @@ export class LifecycleCoordinator {
     await this.#update((state) => {
       state.creationIntents = (state.creationIntents ?? []).filter((entry) => entry.sessionId !== sessionId);
     });
+  }
+
+  /**
+   * 首次升级迁移：账本里还没有房间、也还没有完成过迁移时，用多证据只读审计认领旧房间。
+   *
+   * 这是「旧版本房间也能被交接」的唯一入口（K01）。判据全部来自 `legacy.js` 的三方证据
+   * （registry 登记 + 真实目录 + session header），证据不足的房间不认领、只留诊断；
+   * 迁移完成后写 `migration.completed` 作为可验证标记，账本后来丢失不会静默重跑。
+   * @returns {Promise<{legacy?: object}>}
+   */
+  async #migrateLegacy(ledger) {
+    const rooms = Array.isArray(ledger?.rooms) ? ledger.rooms : [];
+    if (rooms.length > 0) return {};
+    if (ledger?.migration?.completed === true) return {};
+    if (this.#identity.root === '' || this.#identity.dshHome === '') return {};
+
+    let audit;
+    /** 迁移时看到的原生成员表：用来把「本来就在房间里」的成员标成 attached。 */
+    const attachedByWorkspace = new Map();
+    try {
+      audit = await auditLegacyRooms({
+        root: this.#identity.root,
+        dshHome: this.#identity.dshHome,
+        profileId: this.#identity.profileId,
+        pluginId: this.#identity.pluginId,
+        recordedIdentities: [],
+        detect: {
+          // legacy 审计要的是 {header, logPath} 信封，host-adapter 给的是裸 header。
+          readSessionHeader: async (sessionId) => {
+            const header = await readSessionHeader(this.#ctx, sessionId);
+            return header === null ? null : {header, logPath: null, logFound: true};
+          },
+          listRegistry: async () => {
+            const registry = await readRegistry(this.#ctx);
+            if (registry.ok === false) return null;
+            for (const workspace of registry.workspaces) {
+              attachedByWorkspace.set(workspace.id, new Set(workspace.sessionIds ?? []));
+            }
+            return {workspaces: registry.workspaces, archivedSessionIds: []};
+          },
+          // 走到这里就说明「账本里没有房间、迁移也没完成」，对审计而言等同一个全新的
+          // 安装：若把 ledgerExists 报成 true，审计会把每个旧房间都判成 LEDGER_PRESENT
+          // 而永远不认领（v0.1.1 升级就彻底失效）。真正的「账本丢失」由 store 的初始化
+          // 标记拦在更外层，不会走到这里。
+          readScopeState: async () => ({ledgerExists: false, migrationCompleted: false}),
+        },
+      });
+    } catch (error) {
+      this.#diagnostics.push({code: REASON.LEDGER_WRITE_FAILED, message: `legacy audit failed: ${String(error?.message ?? error).slice(0, 200)}`});
+      return {};
+    }
+
+    const drafts = [];
+    for (const room of audit.adoptable ?? []) {
+      const draft = legacyRoomDraft(room, {now: this.#clock()});
+      if (draft === null || typeof draft.workspaceId !== 'string' || draft.workspaceId === '') continue;
+      // 审计只知道「目录与 header 对得上」，但迁移出来的房间本来就挂在原生登记里；
+      // 不标 attached 的话托管集合会是空的，交接/维护都会以为房间没有成员。
+      const attached = attachedByWorkspace.get(draft.workspaceId) ?? new Set();
+      for (const member of draft.members) {
+        if (attached.has(member.sessionId)) member.eligibility = ELIGIBILITY.ATTACHED;
+      }
+      draft.sessionIds = draft.members
+        .filter((member) => member.eligibility === ELIGIBILITY.ATTACHED || member.eligibility === ELIGIBILITY.ELIGIBLE)
+        .map((member) => member.sessionId);
+      drafts.push(draft);
+    }
+    const ambiguous = (audit.rooms ?? []).filter((room) => room.classification === 'ambiguous').length;
+    const rejected = (audit.rejected ?? []).length;
+    const evidence = {
+      auditAt: new Date(this.#clock()).toISOString(),
+      adopted: drafts.length,
+      ambiguous,
+      rejected,
+      roomsSeen: (audit.rooms ?? []).length,
+    };
+    // 有歧义证据时仍记为「已审计」，否则每次启动都会重扫；歧义房间只留计数，不猜归属。
+    const result = await this.#updateRequired((state) => {
+      state.rooms = Array.isArray(state.rooms) ? state.rooms : [];
+      const known = new Set(state.rooms.map((room) => room.workspaceId));
+      for (const draft of drafts) if (!known.has(draft.workspaceId)) state.rooms.push(draft);
+      state.migration = {version: 1, completed: true, at: new Date(this.#clock()).toISOString(), evidence};
+    });
+    if (result.ok === false) {
+      this.degrade(result.code ?? REASON.LEDGER_WRITE_FAILED, 'legacy migration could not be persisted');
+      return {};
+    }
+    if (drafts.length > 0) this.#log({event: 'legacy-migrated', ...evidence});
+    return {legacy: evidence};
   }
 
   /** 启动对账：超过 10 分钟仍是 PENDING 的意图判为 ABANDONED（不猜结果、不重启创建）。 */
@@ -324,7 +484,7 @@ export class LifecycleCoordinator {
         result.conflicts.push(room.ownerSessionId);
         continue;
       }
-
+      const derived = await this.#derivedMembers(room, live.sessionIds, own);
       const persisted = await this.#update((state) => {
         const index = (state.rooms ?? []).findIndex((entry) => entry.workspaceId === room.workspaceId);
         if (index === -1) return;
@@ -339,6 +499,18 @@ export class LifecycleCoordinator {
           },
           error: null,
         });
+        // 同目录派生会话在交接前补进账本：它们和 owner 是同一个房间（R05），
+        // 不补的话「原生 create 出来的第二会话」下次又会被当陌生人。
+        if (derived.length > 0) {
+          const known = new Set(state.rooms[index].sessionIds ?? []);
+          const merged = [...known, ...derived.filter((sessionId) => !known.has(sessionId))];
+          state.rooms[index].sessionIds = merged;
+          const memberIds = new Set((state.rooms[index].members ?? []).map((member) => member.sessionId));
+          state.rooms[index].members = [
+            ...(state.rooms[index].members ?? []),
+            ...derived.filter((sessionId) => !memberIds.has(sessionId)).map((sessionId) => ({sessionId, eligibility: ELIGIBILITY.ELIGIBLE})),
+          ];
+        }
       });
       if (persisted === null) {
         result.failed.push({sessionId: room.ownerSessionId, code: REASON.LEDGER_WRITE_FAILED});
@@ -412,11 +584,29 @@ export class LifecycleCoordinator {
     for (const sessionId of sessionIds) {
       if (own.has(sessionId)) continue;
       const header = await readSessionHeader(this.#ctx, sessionId);
-      const cwd = header.ok === true ? header.header?.cwd : undefined;
+      const cwd = headerCwd(header);
       if (typeof cwd === 'string' && canonicalPath(cwd) === room.canonicalCwd) continue;
       foreign.push(sessionId);
     }
     return foreign;
+  }
+
+  /**
+   * 房间实际成员里，同目录派生出来、但账本还没记过的会话。
+   *
+   * 宿主允许直接 `sessionController.create({workspaceId})`，这类会话与房间同 cwd，属于同一个
+   * 房间（R05），必须补进账本，否则下次停用又会把它们当陌生人（验收 F01 的后半句）。
+   * @returns {Promise<string[]>}
+   */
+  async #derivedMembers(room, sessionIds, own) {
+    const derived = [];
+    for (const sessionId of sessionIds) {
+      if (own.has(sessionId)) continue;
+      const header = await readSessionHeader(this.#ctx, sessionId);
+      const cwd = headerCwd(header);
+      if (typeof cwd === 'string' && canonicalPath(cwd) === room.canonicalCwd) derived.push(sessionId);
+    }
+    return derived;
   }
 
   async #transitionRoom(workspaceId, next, {operation, error} = {}) {
@@ -505,9 +695,22 @@ export class LifecycleCoordinator {
         state.rooms[index].directoryIdentity = directoryIdentityOf(stat) ?? state.rooms[index].directoryIdentity;
       });
 
-      const live = registry.workspaces.find((workspace) => workspace.path === room.cwd);
-      let workspaceId = live?.id ?? room.workspaceId;
-      if (live === undefined) {
+      // 同路径登记分三种：自己的（id 与账本一致）、别人的（用户新登记）、没有。
+      // 只有「id 与账本一致」才能复用；用户自己登记的同路径工作区说明这个 cwd 已被收编，
+      // 绝不能把旧会话挂进去（验收 F02 / R08 / R09）。
+      const samePath = registry.workspaces.filter((workspace) => workspace.path === room.cwd);
+      const ours = samePath.find((workspace) => workspace.id === room.workspaceId);
+      const foreignSamePath = samePath.filter((workspace) => workspace.id !== room.workspaceId);
+      if (foreignSamePath.length > 0) {
+        await this.#transitionRoom(room.workspaceId, ROOM_STATE.RELEASED, {
+          error: {phase: 'restore', code: REASON.USER_CLAIMED, reason: REASON.USER_CLAIMED, at: new Date().toISOString(), workspaceId: foreignSamePath[0].id},
+        });
+        summary.released.push(room.ownerSessionId);
+        continue;
+      }
+
+      let workspaceId = ours?.id;
+      if (workspaceId === undefined) {
         const created = await createWorkspace(this.#ctx, room.cwd, room.cwd.split(path.sep).pop() ?? '');
         if (created.ok === false) {
           await this.#transitionRoom(room.workspaceId, ROOM_STATE.DETACHED, {
@@ -516,10 +719,31 @@ export class LifecycleCoordinator {
           summary.conflicts.push(room.ownerSessionId);
           continue;
         }
+        // 宿主对同一 canonical 路径会返回既有实体；返回值不属于我们刚建的那份就说明并发有人
+        // 抢先登记了同一个 cwd，此时按用户收编处理，不 attach。
+        const afterCreate = await readRegistry(this.#ctx);
+        const atPath = afterCreate.ok ? afterCreate.workspaces.filter((workspace) => workspace.path === room.cwd) : [];
+        if (atPath.length > 1 || (atPath.length === 1 && atPath[0].id !== created.workspaceId)) {
+          await this.#transitionRoom(room.workspaceId, ROOM_STATE.RELEASED, {
+            error: {phase: 'restore', code: REASON.USER_CLAIMED, reason: REASON.USER_CLAIMED, at: new Date().toISOString()},
+          });
+          summary.released.push(room.ownerSessionId);
+          continue;
+        }
         workspaceId = created.workspaceId;
       }
 
-      const attached = await attachSessions(this.#ctx, workspaceId, eligible);
+      // 逐个 attach 前重新读原生快照：宿主没有原子的「条件挂接」，只能把检查贴到每一次挂接前。
+      const attached = await attachSessions(this.#ctx, workspaceId, eligible, {
+        verify: async (sessionId) => {
+          const latest = await readRegistry(this.#ctx);
+          if (latest.ok === false) return false;
+          const claim = latest.claimedBy.get(sessionId);
+          if (claim !== undefined && claim !== '' && claim !== workspaceId) return false;
+          const target = latest.workspaces.find((workspace) => workspace.id === workspaceId);
+          return target !== undefined && target.path === room.cwd;
+        },
+      });
       const failedIds = new Set(attached.failed.map((entry) => entry.sessionId));
       if (attached.missing) {
         await this.#transitionRoom(room.workspaceId, ROOM_STATE.DETACHED, {
@@ -543,9 +767,18 @@ export class LifecycleCoordinator {
             : null,
         });
         state.rooms[index].workspaceId = workspaceId;
+        // 成员资格逐条保留：只有真的挂上去的才是 attached。用户已收编的成员不能因为房间
+        // 整体恢复成功就被改写成 attached，否则前端和 ensure/sweep 会把它当托管对象（验收 F03）。
+        const attachedIds = new Set(attached.attached);
         state.rooms[index].members = members.map((member) => ({
           ...member,
-          eligibility: failedIds.has(member.sessionId) ? ELIGIBILITY.CONFLICT : ELIGIBILITY.ATTACHED,
+          eligibility: failedIds.has(member.sessionId)
+            ? ELIGIBILITY.CONFLICT
+            : attachedIds.has(member.sessionId)
+              ? ELIGIBILITY.ATTACHED
+              : member.eligibility === ELIGIBILITY.ELIGIBLE
+                ? ELIGIBILITY.CONFLICT
+                : member.eligibility,
         }));
       });
       if (nextState === ROOM_STATE.MANAGED) summary.restored.push(room.ownerSessionId);
@@ -568,10 +801,19 @@ export class LifecycleCoordinator {
     const rooms = Array.isArray(ledger?.rooms) ? ledger.rooms : [];
     const workspaceIds = [];
     const sessionIds = [];
+    const MANAGED_ROOM_STATES = new Set([ROOM_STATE.MANAGED, ROOM_STATE.PARTIAL, ROOM_STATE.RESTORING]);
     for (const room of rooms) {
-      if (room.state !== ROOM_STATE.MANAGED && room.state !== ROOM_STATE.PARTIAL && room.state !== ROOM_STATE.RESTORING) continue;
+      if (!MANAGED_ROOM_STATES.has(room.state)) continue;
       if (typeof room.workspaceId === 'string' && room.workspaceId !== '') workspaceIds.push(room.workspaceId);
-      for (const sessionId of room.sessionIds ?? []) sessionIds.push(sessionId);
+      // 逐成员过滤：用户收编（user-owned）、冲突、日志缺失的成员不属于托管集合，
+      // 否则前端会把用户的会话也压平进「独立对话」（验收 F03）。
+      for (const member of room.members ?? []) {
+        if (member.eligibility === ELIGIBILITY.ATTACHED) sessionIds.push(member.sessionId);
+      }
+      // 账本里还没有 members 汇总的旧房间：退回 sessionIds，但仍受房间状态约束。
+      if (!Array.isArray(room.members) || room.members.length === 0) {
+        for (const sessionId of room.sessionIds ?? []) sessionIds.push(sessionId);
+      }
     }
     return {workspaceIds, sessionIds};
   }
@@ -589,8 +831,19 @@ export class LifecycleCoordinator {
     if (ledger === null) return false;
     const inIntent = (ledger.creationIntents ?? []).some((entry) => entry.sessionId === sessionId);
     if (inIntent) return true;
-    return (ledger.rooms ?? []).some((room) =>
-      (room.sessionIds ?? []).includes(sessionId) || room.ownerSessionId === sessionId);
+    const MANAGED_ROOM_STATES = new Set([ROOM_STATE.MANAGED, ROOM_STATE.PARTIAL, ROOM_STATE.RESTORING]);
+    return (ledger.rooms ?? []).some((room) => {
+      // RELEASED / CONFLICT / DETACHED 房间不再触发补登记：用户的安排优先（R09）。
+      if (!MANAGED_ROOM_STATES.has(room.state)) return false;
+      const members = Array.isArray(room.members) ? room.members : null;
+      if (members !== null && members.length > 0) {
+        const member = members.find((entry) => entry.sessionId === sessionId);
+        // 成员表里没有的人，只有 owner 本身还按房间认（旧账本兼容）；其余一律不算托管。
+        if (member === undefined) return room.ownerSessionId === sessionId;
+        return member.eligibility === ELIGIBILITY.ATTACHED;
+      }
+      return (room.sessionIds ?? []).includes(sessionId) || room.ownerSessionId === sessionId;
+    });
   }
 
   /** 供 HTTP status 使用的摘要（不含任何对话内容）。 */
