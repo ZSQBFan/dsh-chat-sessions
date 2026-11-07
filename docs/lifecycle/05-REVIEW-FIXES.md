@@ -62,6 +62,8 @@ R01–R18 全部保留。复审没有推翻任何一条，只暴露了实现与�
 - 缺失 leaf 但祖先存在时，scope identity 解析已有祖先的真实路径并保留缺失尾部；这样 root 祖先软链接在目录后来创建后不会切换账本，同时修复 macOS `/var` 与 `/private/var` 的 scope 差异。
 - legacy 审计同时识别规范 realpath scope 与兼容的原始路径 scope，避免当前账本因路径别名漏检；coordinator 的同路径保护和 attach 前复查使用已有路径身份比较。
 - history 恢复对账显式暴露 `clean | pending | recovering | blocked`；锁忙、durability unknown、校验或恢复写失败统一进入 `blocked`。coordinator 启动先检查该状态，blocked 时进入 `DEGRADED`、禁止生命周期写入口，不会把可读但未恢复的 ledger 宣告为 READY。
+- PENDING intent adoption 复用 restore 的 `classifyMember` 资格：header 缺失、cwd 不匹配、subagent、外部 Workspace claim 不进入托管成员；owner 不满足资格时保留 PENDING。adoption 提交前重新读取原生 registry，Workspace 身份或 owner membership 变化时阻断。
+- restore 任一 required 状态迁移失败会立即停止本轮恢复，避免账本不可提交时继续 create/attach 后续房间；`RESTORING` 与实际 Workspace ID 保留给下一次启用或停用清理。
 - history 裁剪也使用同一把锁，并对临时文件和父目录执行 fsync。
 
-新增 `check-lifecycle-store.mjs` 第12、13项及 root symlink 回归项覆盖同代 revision、identity/foreign/invalid history、恢复锁忙和“有效账本不得被较新但不合法 history 覆盖”；`check-lifecycle-review2.mjs` 的 R2-F09 覆盖 coordinator 在启动恢复锁忙时进入 DEGRADED。当前完整套件为 137/137，结构检查为81项。
+新增 `check-lifecycle-store.mjs` 第12、13项及 root symlink 回归项覆盖同代 revision、identity/foreign/invalid history、恢复锁忙和“有效账本不得被较新但不合法 history 覆盖”；`check-lifecycle-review2.mjs` 的 R2-F09～R2-F11 覆盖 coordinator 恢复锁忙、PENDING 成员资格过滤和终态写失败 fail-stop。当前完整套件为 139/139，结构检查为81项。

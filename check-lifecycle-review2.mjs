@@ -322,3 +322,81 @@ test('R2-F09 启动 history 恢复锁忙：协调器必须 DEGRADED，不得宣�
     await host.close();
   }
 });
+
+
+test('R2-F10 PENDING adoption 复用成员资格：只收编 owner 与同 cwd 普通会话', async () => {
+  const {home, root, host} = await sandbox();
+  try {
+    const owner = `session-${'b'.repeat(8)}-bbbb-4bbb-8bbb-bbbbbbbbbbbb`;
+    const subagent = `session-${'c'.repeat(8)}-cccc-4ccc-8ccc-cccccccccccc`;
+    const cwd = join(root, '.sessions', owner);
+    await mkdir(cwd, {recursive: true});
+    host.seedSession({cwd, id: owner});
+    host.seedSession({cwd, id: subagent, origin: 'subagent'});
+
+    const first = await open({host, home, root});
+    await first.coordinator.start();
+    const begun = await first.coordinator.beginCreate({sessionId: owner, cwd, canonicalCwd: cwd});
+    assert.equal(begun.ok, true);
+    const workspace = await host.registry.create(cwd, '独立对话');
+    await workspace.attachSession(owner);
+    await workspace.attachSession(subagent);
+    await first.coordinator.close();
+
+    const restarted = await open({host, home, root});
+    const started = await restarted.coordinator.start();
+    assert.equal(started.ok, true, JSON.stringify(started));
+    const after = await ledgerOf(restarted.store);
+    assert.deepEqual(after.rooms[0].sessionIds, [owner]);
+    assert.equal(after.creationIntents[0].state, 'ADOPTED');
+    assert.equal(restarted.coordinator.managedSets(after).sessionIds.includes(subagent), false);
+    await restarted.coordinator.close();
+  } finally {
+    await host.close();
+  }
+});
+
+
+test('R2-F11 restore terminal write failure stops later rooms', async () => {
+  const {home, root, host} = await sandbox();
+  try {
+    const owners = [
+      `session-${'d'.repeat(8)}-dddd-4ddd-8ddd-dddddddddddd`,
+      `session-${'e'.repeat(8)}-eeee-4eee-8eee-eeeeeeeeeeee`,
+    ];
+    const rooms = [];
+    for (const [index, owner] of owners.entries()) {
+      const cwd = join(root, '.sessions', owner);
+      await mkdir(cwd, {recursive: true});
+      host.seedSession({cwd, id: owner});
+      rooms.push({
+        workspaceId: `ws-old-${index + 1}`,
+        ownerSessionId: owner,
+        cwd,
+        canonicalCwd: cwd,
+        state: ROOM_STATE.DETACHED,
+        sessionIds: [owner],
+        members: [{sessionId: owner, eligibility: ELIGIBILITY.ELIGIBLE}],
+        operation: null,
+        lastError: null,
+      });
+    }
+    const seeded = await LedgerStore.open({dshHome: home, canonicalRoot: root, profileId: 'review-2'});
+    await seeded.update((state) => {
+      state.migration = {version: 1, completed: true, at: new Date().toISOString(), evidence: {}};
+      state.rooms = rooms;
+    });
+    await seeded.close();
+
+    const reopened = await open({host, home, root, failAt: 3});
+    const started = await reopened.coordinator.start();
+    assert.equal(started.ok, false);
+    assert.equal(reopened.coordinator.state, PROCESS_STATE.DEGRADED);
+    assert.equal(host.workspaces.length, 1, '第一个房间收尾失败后不得创建第二个 Workspace');
+    const after = await ledgerOf(reopened.store);
+    assert.equal(after.rooms[0].state, ROOM_STATE.RESTORING);
+    await reopened.coordinator.close();
+  } finally {
+    await host.close();
+  }
+});

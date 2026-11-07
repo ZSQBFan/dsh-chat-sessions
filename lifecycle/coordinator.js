@@ -440,6 +440,36 @@ export class LifecycleCoordinator {
     return {legacy: evidence};
   }
 
+  async #qualifyMembers({sessionIds, ownerSessionId, canonicalCwd, workspaceId, registry}) {
+    const comparisonCwd = await canonicalExistingPath(canonicalCwd);
+    const members = [];
+    const rejected = [];
+    for (const sessionId of sessionIds ?? []) {
+      const header = await readSessionHeader(this.#ctx, sessionId);
+      const claimedBy = registry.claimedBy.get(sessionId) ?? null;
+      const eligibility = classifyMember({
+        header,
+        claimedBy,
+        isSubagent: isSubagentHeader(header),
+        canonicalCwd: comparisonCwd,
+        workspaceId,
+      });
+      if (eligibility === ELIGIBILITY.ELIGIBLE) {
+        members.push({
+          sessionId,
+          eligibility: sessionId === ownerSessionId ? ELIGIBILITY.ATTACHED : ELIGIBILITY.ELIGIBLE,
+        });
+      } else {
+        rejected.push({sessionId, eligibility});
+      }
+    }
+    return {
+      members,
+      rejected,
+      ownerQualified: members.some((member) => member.sessionId === ownerSessionId),
+    };
+  }
+
   /**
    * 启动对账：PENDING 意图必须先看原生事实，再决定收敛方式（复审 R2-F04）。
    *
@@ -476,24 +506,20 @@ export class LifecycleCoordinator {
       }
       if (room !== undefined) {
         const stat = await statDirectory(entry.cwd);
-        const members = [];
-        for (const sessionId of room.sessionIds) {
-          const header = await readSessionHeader(this.#ctx, sessionId);
-          if (isSubagentHeader(header)) continue;
-          members.push({
-            sessionId,
-            eligibility: sessionId === entry.sessionId ? ELIGIBILITY.ATTACHED : ELIGIBILITY.ELIGIBLE,
-          });
-        }
-        if (!members.some((member) => member.sessionId === entry.sessionId)) {
-          abandoned.push(entry);
-          continue;
-        }
+        const qualified = await this.#qualifyMembers({
+          sessionIds: room.sessionIds,
+          ownerSessionId: entry.sessionId,
+          canonicalCwd: canonical,
+          workspaceId: room.id,
+          registry,
+        });
+        // owner 不满足资格时保留 PENDING，等待下一次原生快照，而不是猜测 ADOPTED。
+        if (!qualified.ownerQualified) continue;
         adopted.push({
           entry,
           workspaceId: room.id,
           directoryIdentity: directoryIdentityOf(stat),
-          members,
+          members: qualified.members,
         });
         continue;
       }
@@ -502,6 +528,22 @@ export class LifecycleCoordinator {
       const sessionExists = typeof sessionCwd === 'string' && sessionCwd !== '';
       const at = Date.parse(entry.createdAt ?? entry.at ?? '');
       if (sessionExists || (Number.isFinite(at) && now - at > 10 * 60 * 1000)) abandoned.push(entry);
+    }
+    for (const item of adopted) {
+      const fresh = await readRegistry(this.#ctx);
+      if (fresh.ok === false) {
+        this.degrade(REASON.LEDGER_WRITE_FAILED, 'creation intent workspace changed: registry unreadable');
+        return {blocked: REASON.LEDGER_WRITE_FAILED};
+      }
+      const current = fresh.workspaces.find((workspace) => workspace.id === item.workspaceId);
+      if (current === undefined
+        || !Array.isArray(current.sessionIds)
+        || !current.sessionIds.includes(item.entry.sessionId)
+        || typeof current.path !== 'string'
+        || !(await sameExistingPath(current.path, item.entry.cwd))) {
+        this.degrade(REASON.LEDGER_WRITE_FAILED, 'creation intent workspace changed before adoption');
+        return {blocked: REASON.LEDGER_WRITE_FAILED};
+      }
     }
     if (adopted.length === 0 && abandoned.length === 0) return {intentsAbandoned: 0, intentsAdopted: 0};
 
@@ -761,7 +803,7 @@ export class LifecycleCoordinator {
   }
 
   async #transitionRoom(workspaceId, next, {operation, error} = {}) {
-    await this.#update((state) => {
+    return this.#update((state) => {
       const index = (state.rooms ?? []).findIndex((entry) => entry.workspaceId === workspaceId);
       if (index === -1) return;
       const options = {now: this.#clock()};
@@ -769,6 +811,19 @@ export class LifecycleCoordinator {
       if (error !== undefined) options.error = error;
       state.rooms[index] = roomTransition(state.rooms[index], next, options);
     });
+  }
+
+  async #transitionRoomRequired(workspaceId, next, options = {}) {
+    const result = await this.#updateRequired((state) => {
+      const index = (state.rooms ?? []).findIndex((entry) => entry.workspaceId === workspaceId);
+      if (index === -1) return;
+      const transition = {now: this.#clock()};
+      if (options.operation !== undefined) transition.operation = options.operation;
+      if (options.error !== undefined) transition.error = options.error;
+      state.rooms[index] = roomTransition(state.rooms[index], next, transition);
+    });
+    if (result.ok === false) this.degrade(result.code ?? REASON.LEDGER_WRITE_FAILED, 'restore room transition could not be persisted');
+    return result;
   }
 
   /**
@@ -799,9 +854,13 @@ export class LifecycleCoordinator {
       const directory = classifyDirectory(room, stat);
       if (directory !== 'ok') {
         const reason = directory === 'missing' ? REASON.DIRECTORY_MISSING : REASON.DIRECTORY_IDENTITY_CHANGED;
-        await this.#transitionRoom(room.workspaceId, ROOM_STATE.CONFLICT, {
+        const transitioned = await this.#transitionRoomRequired(room.workspaceId, ROOM_STATE.CONFLICT, {
           error: {phase: 'restore', code: reason, reason, at: new Date().toISOString()},
         });
+        if (transitioned.ok === false) {
+          summary.blocked = transitioned.code ?? REASON.LEDGER_WRITE_FAILED;
+          return summary;
+        }
         summary.conflicts.push(room.ownerSessionId);
         continue;
       }
@@ -831,16 +890,24 @@ export class LifecycleCoordinator {
         continue;
       }
       if (eligible.length === 0 && userOwned.length > 0) {
-        await this.#transitionRoom(room.workspaceId, ROOM_STATE.RELEASED, {
+        const transitioned = await this.#transitionRoomRequired(room.workspaceId, ROOM_STATE.RELEASED, {
           error: {phase: 'restore', code: REASON.USER_CLAIMED, reason: REASON.USER_CLAIMED, at: new Date().toISOString()},
         });
+        if (transitioned.ok === false) {
+          summary.blocked = transitioned.code ?? REASON.LEDGER_WRITE_FAILED;
+          return summary;
+        }
         summary.released.push(room.ownerSessionId);
         continue;
       }
       if (eligible.length === 0) {
-        await this.#transitionRoom(room.workspaceId, ROOM_STATE.CONFLICT, {
+        const transitioned = await this.#transitionRoomRequired(room.workspaceId, ROOM_STATE.CONFLICT, {
           error: {phase: 'restore', code: REASON.CWD_MISMATCH, reason: REASON.CWD_MISMATCH, at: new Date().toISOString()},
         });
+        if (transitioned.ok === false) {
+          summary.blocked = transitioned.code ?? REASON.LEDGER_WRITE_FAILED;
+          return summary;
+        }
         summary.conflicts.push(room.ownerSessionId);
         continue;
       }
@@ -880,9 +947,13 @@ export class LifecycleCoordinator {
       const ours = samePath.find((workspace) => workspace.id === room.workspaceId);
       const foreignSamePath = samePath.filter((workspace) => workspace.id !== room.workspaceId);
       if (foreignSamePath.length > 0) {
-        await this.#transitionRoom(room.workspaceId, ROOM_STATE.RELEASED, {
+        const transitioned = await this.#transitionRoomRequired(room.workspaceId, ROOM_STATE.RELEASED, {
           error: {phase: 'restore', code: REASON.USER_CLAIMED, reason: REASON.USER_CLAIMED, at: new Date().toISOString(), workspaceId: foreignSamePath[0].id},
         });
+        if (transitioned.ok === false) {
+          summary.blocked = transitioned.code ?? REASON.LEDGER_WRITE_FAILED;
+          return summary;
+        }
         summary.released.push(room.ownerSessionId);
         continue;
       }
@@ -891,9 +962,13 @@ export class LifecycleCoordinator {
       if (workspaceId === undefined) {
         const created = await createWorkspace(this.#ctx, room.cwd, room.cwd.split(path.sep).pop() ?? '');
         if (created.ok === false) {
-          await this.#transitionRoom(room.workspaceId, ROOM_STATE.DETACHED, {
+          const transitioned = await this.#transitionRoomRequired(room.workspaceId, ROOM_STATE.DETACHED, {
             error: toErrorRecord('restore', created.error, REASON.LEDGER_WRITE_FAILED),
           });
+          if (transitioned.ok === false) {
+            summary.blocked = transitioned.code ?? REASON.LEDGER_WRITE_FAILED;
+            return summary;
+          }
           summary.conflicts.push(room.ownerSessionId);
           continue;
         }
@@ -907,9 +982,13 @@ export class LifecycleCoordinator {
            }
          }
         if (atPath.length > 1 || (atPath.length === 1 && atPath[0].id !== created.workspaceId)) {
-          await this.#transitionRoom(room.workspaceId, ROOM_STATE.RELEASED, {
+          const transitioned = await this.#transitionRoomRequired(room.workspaceId, ROOM_STATE.RELEASED, {
             error: {phase: 'restore', code: REASON.USER_CLAIMED, reason: REASON.USER_CLAIMED, at: new Date().toISOString()},
           });
+          if (transitioned.ok === false) {
+            summary.blocked = transitioned.code ?? REASON.LEDGER_WRITE_FAILED;
+            return summary;
+          }
           summary.released.push(room.ownerSessionId);
           continue;
         }
@@ -982,7 +1061,7 @@ export class LifecycleCoordinator {
         this.degrade(final.code ?? REASON.LEDGER_WRITE_FAILED, 'restore terminal state could not be persisted');
         summary.blocked = final.code ?? REASON.LEDGER_WRITE_FAILED;
         summary.conflicts.push(room.ownerSessionId);
-        continue;
+        return summary;
       }
       if (nextState === ROOM_STATE.MANAGED) summary.restored.push(room.ownerSessionId);
       else summary.partial.push(room.ownerSessionId);
