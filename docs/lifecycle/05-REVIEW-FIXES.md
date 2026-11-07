@@ -59,6 +59,8 @@ R01–R18 全部保留。复审没有推翻任何一条，只暴露了实现与�
 - history 写入分为 `prepared` 与 `committed` 两阶段。prepared 记录先完成文件 fsync，主账本 rename 成功后再追加 committed 记录；history 写失败会让关键 update 失败并携带持久性不确定状态。
 - history 恢复只接受 schema、scopeId、generation、revision 全部一致的 committed 状态，并按 `revision`、再按 `generation` 选择最新提交。
 - rollback 与启动对账都必须重新取得同一把锁，在锁内重读当前账本并通过 revision fence；当前账本已经更新时保留它，避免恢复路径再覆盖后续 writer。
+- 缺失 leaf 但祖先存在时，scope identity 解析已有祖先的真实路径并保留缺失尾部；这样 root 祖先软链接在目录后来创建后不会切换账本，同时修复 macOS `/var` 与 `/private/var` 的 scope 差异。
+- legacy 审计同时识别规范 realpath scope 与兼容的原始路径 scope，避免当前账本因路径别名漏检；coordinator 的同路径保护和 attach 前复查使用已有路径身份比较。
 - history 裁剪也使用同一把锁，并对临时文件和父目录执行 fsync。
 
-新增 `check-lifecycle-store.mjs` 第12项覆盖同代 revision、foreign/invalid history 和“有效账本不得被较新但不合法 history 覆盖”；完整套件当前为 134/134，结构检查为81项。
+新增 `check-lifecycle-store.mjs` 第12项及 root symlink 回归项覆盖同代 revision、foreign/invalid history 和“有效账本不得被较新但不合法 history 覆盖”；完整套件当前为 135/135，结构检查为81项。
