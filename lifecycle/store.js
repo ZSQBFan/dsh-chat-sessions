@@ -25,7 +25,7 @@
  * 契约：docs/lifecycle/04-IMPLEMENTATION-CONTRACT.md §2、§4、§5。
  */
 import { createHash, randomBytes } from 'node:crypto';
-import { copyFile, mkdir, open, readFile, realpath, rename, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, copyFile, mkdir, open, readFile, realpath, rename, unlink, writeFile } from 'node:fs/promises';
 import { homedir, hostname } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 
@@ -62,6 +62,11 @@ export const LEDGER_MISSING_AFTER_INIT = 'LEDGER_MISSING_AFTER_INIT';
  * 命中的话 rename 语义仍然成立（同目录原子替换），只是无法再确认目录项落盘，
  * 降级为已知限制；不在白名单里的一律当真实 I/O 故障上报（fail-safe）。
  */
+/** 提交历史：每次成功提交追加一行完整状态，用于「提交后才发现锁易主」时回滚到接管者的内容。 */
+const HISTORY_FILE = 'history.jsonl';
+/** 历史最多保留的条目数（打开时裁剪，只留最近若干条）。 */
+const HISTORY_LIMIT = 10;
+
 const DIRECTORY_FSYNC_UNSUPPORTED_CODES = new Set([
   'EPERM',
   'EINVAL',
@@ -145,6 +150,7 @@ export class LedgerStore {
   #directory;
   #path;
   #markerPath;
+  #historyPath;
   #clock;
   #leaseMs;
   #status = 'absent';
@@ -203,6 +209,7 @@ export class LedgerStore {
     this.#directory = ledgerDirectory({ dshHome: identity.dshHome, scopeId: this.#scopeId });
     this.#path = join(this.#directory, 'ledger.json');
     this.#markerPath = join(this.#directory, INITIALIZATION_MARKER_FILE);
+    this.#historyPath = join(this.#directory, HISTORY_FILE);
     this.#clock = clock;
     this.#leaseMs = Number.isFinite(leaseMs) && leaseMs > 0 ? leaseMs : DEFAULT_LOCK_LEASE_MS;
   }
@@ -332,6 +339,7 @@ export class LedgerStore {
       return;
     }
     await this.#loadFromDisk();
+    await this.#pruneHistory();
   }
 
   /**
@@ -371,6 +379,8 @@ export class LedgerStore {
     await this.#adopt(raw);
     // 账本在、标记不在（老版本升级或标记被误删）：账本才是权威，补写标记。
     if (this.#status === 'ready' && marker !== 'present') await this.#repairInitializationMarker();
+    // 账本比提交历史更旧：上次提交后崩溃／回滚未完成，按历史恢复（诊断留痕）。
+    if (this.#status === 'ready') await this.#reconcileWithHistory();
   }
 
   /**
@@ -522,6 +532,20 @@ export class LedgerStore {
       handle = null;
       await this.#fenceCommit(fence);
       await rename(temporary, this.#path);
+      // rename 之后再看一次锁：fencing 与 rename 之间没有 OS 级条件写，
+      // 若这期间锁被接管（旧进程被 SIGSTOP 后恢复就是这种情况），本次写入已经盖掉了
+      // 对方的提交。先把完整状态追加进 history，再判断归属；锁不是自己的就按 history
+      // 里最新的提交回滚，并如实报 LOCK_LOST（不假装提交成功）。
+      await this.#appendHistory(state);
+      if ((await this.#ownsLock(fence.token)) === false) {
+        const rolled = await this.#rollbackToNewestHistory(state);
+        throw new LedgerWriteError(
+          rolled
+            ? '提交后发现锁已易主：已回滚到接管者最后一次提交，本次写入未生效'
+            : '提交后发现锁已易主：历史里没有更新的提交，账本保留本次内容但归并未确认',
+          { code: WRITE_ERROR_CODE.LOCK_LOST },
+        );
+      }
     } catch (error) {
       if (handle !== null) await handle.close().catch(() => {});
       await unlink(temporary).catch(() => {});
@@ -530,6 +554,109 @@ export class LedgerStore {
         : new LedgerWriteError(`账本写入失败: ${error.message}`, { cause: error });
     }
     await this.#syncDirectory();
+  }
+
+  /** 锁文件里的 token 还是不是自己。 */
+  async #ownsLock(token) {
+    const lock = await readLockFile(join(this.#directory, 'lock.json'));
+    return lock !== null && lock !== 'unreadable' && typeof lock === 'object' && !Array.isArray(lock) && lock.token === token;
+  }
+
+  /**
+   * 每次成功 rename 之后追加一行完整状态。
+   *
+   * 用途只有一个：当提交后才发现锁已易主时，用「接管者最后一次提交」而不是自己更旧的
+   * 内存快照去回滚。追加失败不否决已经落盘的账本（降级记诊断）。
+   */
+  async #appendHistory(state) {
+    try {
+      await appendFile(this.#historyPath, `${JSON.stringify({at: new Date().toISOString(), generation: state.generation, revision: state.revision, state})}\n`, {mode: 0o600});
+    } catch (error) {
+      this.#diagnostics.push({code: REASON.LEDGER_WRITE_FAILED, message: `提交历史追加失败（账本本身已落盘）: ${error.message}`});
+    }
+  }
+
+  /** 读历史里 generation 最新的一条（坏行跳过）。 */
+  async #readNewestHistory() {
+    let text;
+    try {
+      text = await readFile(this.#historyPath, 'utf8');
+    } catch {
+      return null;
+    }
+    let best = null;
+    for (const line of text.split('\n')) {
+      if (line.trim() === '') continue;
+      let entry;
+      try {
+        entry = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (entry === null || typeof entry !== 'object' || entry.state === undefined) continue;
+      const generation = Number(entry.generation);
+      if (!Number.isFinite(generation)) continue;
+      if (best === null || generation > best.generation) best = {generation, state: entry.state};
+    }
+    return best;
+  }
+
+  /**
+   * 回滚到历史里 generation 更高的那条提交。
+   * 只有「对方确实更新」才动手；否则保留本次写入（返回 false）。
+   */
+  async #rollbackToNewestHistory(mine) {
+    const newest = await this.#readNewestHistory();
+    if (newest === null || newest.generation <= (mine.generation ?? 0)) return false;
+    const text = `${JSON.stringify(newest.state, null, 2)}\n`;
+    const temporary = join(this.#directory, `ledger.json.rollback-${randomBytes(8).toString('hex')}`);
+    await writeFile(temporary, text, {mode: 0o600});
+    await rename(temporary, this.#path);
+    await this.#syncDirectory();
+    this.#diagnostics.push({code: WRITE_ERROR_CODE.LOCK_LOST, message: `已回滚到 generation=${newest.generation} 的接管者提交`});
+    return true;
+  }
+
+  /** 打开时裁剪历史，避免无限增长。 */
+  async #pruneHistory() {
+    let text;
+    try {
+      text = await readFile(this.#historyPath, 'utf8');
+    } catch {
+      return;
+    }
+    const lines = text.split('\n').filter((line) => line.trim() !== '');
+    if (lines.length <= HISTORY_LIMIT * 2) return;
+    const keep = lines.slice(-HISTORY_LIMIT);
+    const temporary = join(this.#directory, `history.jsonl.tmp-${randomBytes(8).toString('hex')}`);
+    try {
+      await writeFile(temporary, `${keep.join('\n')}\n`, {mode: 0o600});
+      await rename(temporary, this.#historyPath);
+    } catch {
+      await unlink(temporary).catch(() => {});
+    }
+  }
+
+  /**
+   * 打开时的历史对账：账本 generation 落后于历史里的最新提交，说明上次提交后崩溃或
+   * 回滚没写完，按历史恢复（诊断留痕），不留「文件比历史更旧」的静默状态。
+   */
+  async #reconcileWithHistory() {
+    const newest = await this.#readNewestHistory();
+    if (newest === null) return;
+    if (newest.generation <= (this.#state?.generation ?? 0)) return;
+    const temporary = join(this.#directory, `ledger.json.recover-${randomBytes(8).toString('hex')}`);
+    try {
+      await writeFile(temporary, `${JSON.stringify(newest.state, null, 2)}\n`, {mode: 0o600});
+      await rename(temporary, this.#path);
+      await this.#syncDirectory();
+      this.#diagnostics.push({code: WRITE_ERROR_CODE.LOCK_LOST, message: `启动对账：按历史恢复到 generation=${newest.generation}`});
+      const raw = await readFile(this.#path);
+      await this.#adopt(raw);
+    } catch (error) {
+      await unlink(temporary).catch(() => {});
+      this.#diagnostics.push({code: REASON.LEDGER_WRITE_FAILED, message: `启动对账失败，账本保持原样: ${error.message}`});
+    }
   }
 
   /**
