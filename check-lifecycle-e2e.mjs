@@ -6,7 +6,8 @@
 //
 // 与 `check-lifecycle-native.mjs` 的区别：native 那一层断言的是账本与登记的条件语义；
 // 这一层断言的是**用户看到的结果**——会话确实不再属于任何工作区、文件一个字节没动、
-// 重新启用后仍然是同一批会话。GUI 点击路径的证据在 artifacts 里的 G0-05 截图。
+// 重新启用后仍然是同一批会话。它跑在真宿主上但不开浏览器；浏览器点击路径的证据在
+// RUN-20261107-0410/evidence/gui/GUI-RUN.md（停用 → 未分组 → 继续聊天 → 启用恢复 → 重启保号）。
 //
 // 环境变量与 native 相同（LC_NATIVE_HOME / LC_DSH_MODULES / LC_PLUGIN_DIR / LC_FROM_DEFAULT）。
 import {spawn} from 'node:child_process';
