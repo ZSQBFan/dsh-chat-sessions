@@ -205,13 +205,15 @@ try {
     fail("both the sweep and POST /chat-sessions/link must answer reason: 'owned-by-sibling' (report R9)");
   } else ok('index.js separates workspace and link failures and keys links on the real cwd (D1)');
   /** Round 3 §2.4: a receipt workspace left behind by an archived session must still be renamed. */
-  if (!hostSource.includes('async function normalizeReceiptTitles()')) {
+  if (!hostSource.includes('async function normalizeReceiptTitles(managedWorkspaceIds)')) {
     fail('index.js must normalise receipt workspace titles registry-wide (round 3 §2.4)');
-  } else if (!hostSource.includes('reports.push(...(await normalizeReceiptTitles()));')) {
+  } else if (!hostSource.includes('reports.push(...(await normalizeReceiptTitles(managedWorkspaces)));')) {
     fail('sweep() must run normalizeReceiptTitles() — a stale receipt has no session to visit it');
   } else if (!hostSource.includes('if (workspace.sessionIds.length > 0) continue;')
     || !hostSource.includes('await ctx.workspaceRegistry.delete(workspace.id);')) {
     fail('only a receipt with no sessions and no directory may be dropped (round 3 §2.4)');
+  } else if (!hostSource.includes("reports.push({ status: 'workspace-retained-unmanaged', workspaceId: workspace.id });")) {
+    fail('normalizeReceiptTitles must skip workspaces the ledger does not manage (F07 / R08)');
   } else ok('receipt workspaces are re-titled every sweep and orphans are dropped (round 3 §2.4)');
 } catch (error) {
   fail(`index.js does not import: ${error.message}`);

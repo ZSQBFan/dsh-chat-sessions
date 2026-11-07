@@ -287,7 +287,19 @@ export function apply(ctx, config) {
       canonicalRoot: canonicalPath(root),
       pluginId: 'dsh-chat-sessions',
     });
-    coordinator = new LifecycleCoordinator({ ctx, config, store, log: lifecycleLog });
+    coordinator = new LifecycleCoordinator({
+      ctx,
+      config,
+      store,
+      log: lifecycleLog,
+      // 迁移与账本用同一份 scope 身份：root 用 canonical 路径，profile 用宿主给的稳定名字。
+      identity: {
+        root: canonicalPath(root),
+        profileId,
+        dshHome: effectiveDshHome(),
+        pluginId: 'dsh-chat-sessions',
+      },
+    });
     const outcome = await coordinator.start();
     if (outcome.ok === false) ctx.logger?.warn?.(`[chat-sessions] lifecycle blocked: ${outcome.blocked}`);
     return outcome;
@@ -301,6 +313,32 @@ export function apply(ctx, config) {
     if (!lifecycleEnabled) return true;
     await lifecycleReady;
     return coordinator !== undefined && coordinator.canWrite();
+  }
+
+  /** 账本写入不可用：不是「稍后就绪」，而是这次请求真的没落盘，路由答 503。 */
+  function ledgerUnavailableError(cause) {
+    const error = new Error(`lifecycle ledger unavailable: ${messageOf(cause)}`);
+    error.code = 'LIFECYCLE_LEDGER_UNAVAILABLE';
+    return error;
+  }
+
+  /** 当前托管的工作区 id 集合；账本不可用时返回 null（调用方据此整体跳过写操作）。 */
+  async function managedWorkspaceIdSet() {
+    if (!lifecycleEnabled) return null;
+    await lifecycleReady;
+    if (coordinator === undefined) return null;
+    const described = await coordinator.describe();
+    if (described.state === 'degraded' && described.managed.workspaceIds.length === 0) return new Set();
+    return new Set(described.managed.workspaceIds);
+  }
+
+  /** 当前托管的会话 id 集合；账本不可用时返回 null。 */
+  async function managedSessionIdSet() {
+    if (!lifecycleEnabled) return null;
+    await lifecycleReady;
+    if (coordinator === undefined) return null;
+    const described = await coordinator.describe();
+    return new Set(described.managed.sessionIds);
   }
 
   /** 统一的「未就绪」错误，路由据此答 409 而不是 500。 */
@@ -340,7 +378,15 @@ export function apply(ctx, config) {
     if (!(await lifecycleWritable())) throw notReadyError();
     // 先落创建意图再建原生对象：崩在中间只会留下一条 PENDING 意图（启动对账时判 ABANDONED），
     // 不会出现「目录在、房间没登记」或「房间登记了、成员没挂上」的半个房间。
-    if (coordinator !== undefined) await coordinator.beginCreate({ sessionId, cwd, canonicalCwd });
+    if (coordinator !== undefined) {
+      const intent = await coordinator.beginCreate({ sessionId, cwd, canonicalCwd });
+      if (intent.ok !== true) {
+        // 意图没落盘就不建原生对象：否则会留下「目录/会话都在、账本不知道」的孤儿（验收 F04）。
+        const error = ledgerUnavailableError(intent.code);
+        coordinator.degrade(intent.code ?? 'LEDGER_WRITE_FAILED', error.message);
+        throw error;
+      }
+    }
     let workspaceId;
     let created;
     try {
@@ -380,7 +426,15 @@ export function apply(ctx, config) {
       const directoryIdentity = directory === undefined
         ? null
         : { dev: String(directory.dev), ino: String(directory.ino) };
-      await coordinator.finishCreate({ sessionId, cwd, canonicalCwd, workspaceId, directoryIdentity });
+      const finished = await coordinator.finishCreate({ sessionId, cwd, canonicalCwd, workspaceId, directoryIdentity });
+      if (finished.ok !== true) {
+        // 原生对象已存在、意图仍留在账本里（可对账），但本次请求必须如实报失败并停写。
+        const error = ledgerUnavailableError(finished.code);
+        error.sessionId = created.sessionId;
+        error.workspaceId = workspaceId;
+        coordinator.degrade(finished.code ?? 'LEDGER_WRITE_FAILED', error.message);
+        throw error;
+      }
     } else {
       await coordinator.abortCreate({ sessionId }).catch(() => {});
     }
@@ -690,12 +744,18 @@ export function apply(ctx, config) {
    * Rename every receipt that drifted; drop only those whose directory is gone and that no session
    * references any more.
    */
-  async function normalizeReceiptTitles() {
+  async function normalizeReceiptTitles(managedWorkspaceIds) {
     const reports = [];
     const title = untitledWorkspaceTitle(config);
     const roots = await knownSessionsRoots();
     for (const workspace of ctx.workspaceRegistry.list()) {
       if (!underSessionsRoot(workspace.path, roots)) continue;
+      // 只有账本里明确归本插件管的房间才允许改标题/删登记。路径形状不是所有权证据：
+      // 用户自己放在 root/.sessions 下的普通工作区必须原样保留（验收 F07 / R08 / R14）。
+      if (managedWorkspaceIds !== null && !managedWorkspaceIds.has(workspace.id)) {
+        reports.push({ status: 'workspace-retained-unmanaged', workspaceId: workspace.id });
+        continue;
+      }
       if (workspace.title !== title) {
         try {
           await workspace.setTitle(title);
@@ -729,10 +789,18 @@ export function apply(ctx, config) {
       const durable = await ctx.sessionPersistence.list();
       const archived = new Set(ctx.workspaceRegistry.archivedSessionIds);
       const reports = [];
+      // 生命周期闸门：账本说了算。未托管会话的所有副作用（补目录、软链接、改标题、删登记）
+      // 一律跳过，避免维护逻辑绕过资格判断去动用户的工作区（验收 F07）。
+      const managedSessions = await managedSessionIdSet();
+      const managedWorkspaces = await managedWorkspaceIdSet();
       for (const snapshot of durable) {
         const sessionId = snapshot.header.id;
         if (!underSessionsRoot(snapshot.header.cwd, await knownSessionsRoots())) continue;
         if (only !== undefined && !only.has(sessionId)) continue;
+        if (managedSessions !== null && !managedSessions.has(sessionId)) {
+          reports.push({ status: 'retained-unmanaged', sessionId });
+          continue;
+        }
         const facts = await logFacts(sessionId, snapshot.sizeBytes);
         if (facts === null) continue;
 
@@ -849,7 +917,7 @@ export function apply(ctx, config) {
       // Registry-level tidying runs whatever happened above: a stale receipt has no session
       // pointing at it, so the per-session loop above never sees it.
       try {
-        reports.push(...(await normalizeReceiptTitles()));
+        reports.push(...(await normalizeReceiptTitles(managedWorkspaces)));
       } catch (error) {
         ctx.logger?.warn?.(`[chat-sessions] receipt sweep failed: ${messageOf(error)}`);
       }
@@ -1292,12 +1360,15 @@ export function apply(ctx, config) {
         answer(res, 404, { ok: false, error: `no route for ${req.method} ${url.pathname}` });
       } catch (error) {
         ctx.logger?.warn?.(`[chat-sessions] ${req.method} ${url.pathname} failed: ${messageOf(error)}`);
-        // 生命周期未就绪是预期状态（启动恢复/正在交接/账本坏掉），不是 500。
+        // 生命周期未就绪是预期状态（启动恢复/正在交接/账本坏掉），不是 500；
+        // 账本写不进去则是 503：请求确实没有被持久化，不能靠重试掩盖（验收 F04）。
         const notReady = error?.code === 'LIFECYCLE_NOT_READY';
-        answer(res, notReady ? 409 : 500, {
+        const ledgerDown = error?.code === 'LIFECYCLE_LEDGER_UNAVAILABLE';
+        answer(res, notReady ? 409 : ledgerDown ? 503 : 500, {
           ok: false,
           error: messageOf(error),
           ...(notReady ? { code: 'LIFECYCLE_NOT_READY' } : {}),
+          ...(ledgerDown ? { code: 'LIFECYCLE_LEDGER_UNAVAILABLE', sessionId: error.sessionId ?? null, workspaceId: error.workspaceId ?? null } : {}),
         });
       }
     },
