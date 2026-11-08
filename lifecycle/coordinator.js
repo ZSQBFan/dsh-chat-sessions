@@ -358,10 +358,32 @@ export class LifecycleCoordinator {
    * 迁移完成后写 `migration.completed` 作为可验证标记，账本后来丢失不会静默重跑。
    * @returns {Promise<{legacy?: object}>}
    */
-  async #migrateLegacy(ledger) {
+  /** 显式补接管已审计的旧登记；不重置迁移标记，不接管未指定或已释放的房间。 */
+  async recoverLegacy({workspaceIds} = {}) {
+    if (!this.canWrite()) return {ok: false, blocked: 'LIFECYCLE_NOT_READY'};
+    if (!Array.isArray(workspaceIds) || workspaceIds.length === 0 || workspaceIds.length > 100
+      || workspaceIds.some((id) => typeof id !== 'string' || id === '')) {
+      return {ok: false, blocked: 'WORKSPACE_IDS_REQUIRED'};
+    }
+    const generation = this.#generation;
+    this.#frozen = true;
+    try {
+      const ledger = await this.#read();
+      if (ledger === null || this.#store.status === 'invalid' || this.#store.recoveryState === 'blocked') {
+        this.degrade(REASON.LEDGER_INVALID, 'legacy recovery requires a valid existing ledger');
+        return {ok: false, blocked: REASON.LEDGER_INVALID};
+      }
+      const result = await this.#migrateLegacy(ledger, {workspaceIds: new Set(workspaceIds)});
+      return {ok: result.blocked === undefined, ...result};
+    } finally {
+      if (this.#state === PROCESS_STATE.READY && this.#generation === generation) this.#frozen = false;
+    }
+  }
+
+  async #migrateLegacy(ledger, {workspaceIds = null} = {}) {
     const rooms = Array.isArray(ledger?.rooms) ? ledger.rooms : [];
-    if (rooms.length > 0) return {};
-    if (ledger?.migration?.completed === true) return {};
+    if (workspaceIds === null && rooms.length > 0) return {};
+    if (workspaceIds === null && ledger?.migration?.completed === true) return {};
     if (this.#identity.root === '' || this.#identity.dshHome === '') return {};
 
     let audit;
@@ -396,23 +418,39 @@ export class LifecycleCoordinator {
         },
       });
     } catch (error) {
-      this.#diagnostics.push({code: REASON.LEDGER_WRITE_FAILED, message: `legacy audit failed: ${String(error?.message ?? error).slice(0, 200)}`});
-      return {};
+      this.degrade(REASON.LEDGER_WRITE_FAILED, `legacy audit failed: ${String(error?.message ?? error).slice(0, 200)}`);
+      return {blocked: REASON.LEDGER_WRITE_FAILED};
     }
 
+    // 显式恢复也须走完整三方审计；已有账本条目（包括 RELEASED/CONFLICT）是持久决定，
+    // 不得因路径相同就再次认领。审计后复读成员与目录身份，过期结果留待重试。
+    const registry = await readRegistry(this.#ctx);
+    if (registry.ok === false || audit.scope?.registryAvailable === false) {
+      this.degrade(REASON.LEDGER_WRITE_FAILED, 'legacy registry unavailable');
+      return {blocked: REASON.LEDGER_WRITE_FAILED};
+    }
     const drafts = [];
+    const skipped = [];
     for (const room of audit.adoptable ?? []) {
+      if (workspaceIds !== null && !workspaceIds.has(room.workspaceId)) continue;
+      if (rooms.some((known) => known.workspaceId === room.workspaceId || known.canonicalCwd === room.canonicalCwd)) continue;
       const draft = legacyRoomDraft(room, {now: this.#clock()});
       if (draft === null || typeof draft.workspaceId !== 'string' || draft.workspaceId === '') continue;
-      // 审计只知道「目录与 header 对得上」，但迁移出来的房间本来就挂在原生登记里；
-      // 不标 attached 的话托管集合会是空的，交接/维护都会以为房间没有成员。
-      const attached = attachedByWorkspace.get(draft.workspaceId) ?? new Set();
-      for (const member of draft.members) {
-        if (attached.has(member.sessionId)) member.eligibility = ELIGIBILITY.ATTACHED;
+      const live = registry.workspaces.find((entry) => entry.id === draft.workspaceId);
+      const previousMembers = attachedByWorkspace.get(draft.workspaceId) ?? new Set();
+      const info = await statDirectory(draft.canonicalCwd);
+      if (live === undefined || !(await sameExistingPath(live.path, draft.canonicalCwd))
+        || live.sessionIds.length !== previousMembers.size || live.sessionIds.some((id) => !previousMembers.has(id))
+        || classifyDirectory(draft, info) !== 'ok') {
+        skipped.push({workspaceId: draft.workspaceId, reason: 'EVIDENCE_CHANGED'});
+        continue;
       }
-      draft.sessionIds = draft.members
-        .filter((member) => member.eligibility === ELIGIBILITY.ATTACHED || member.eligibility === ELIGIBILITY.ELIGIBLE)
-        .map((member) => member.sessionId);
+      const qualified = await this.#qualifyMembers({sessionIds: live.sessionIds, ownerSessionId: draft.ownerSessionId,
+        canonicalCwd: draft.canonicalCwd, workspaceId: draft.workspaceId, registry});
+      if (!qualified.ownerQualified) { skipped.push({workspaceId: draft.workspaceId, reason: 'OWNER_NOT_ELIGIBLE'}); continue; }
+      // 只对合格成员标 attached，不能把审计排除的子代理重新提升为托管成员。
+      draft.members = qualified.members.map((member) => ({...member, eligibility: ELIGIBILITY.ATTACHED}));
+      draft.sessionIds = draft.members.map((member) => member.sessionId);
       drafts.push(draft);
     }
     const ambiguous = (audit.rooms ?? []).filter((room) => room.classification === 'ambiguous').length;
@@ -423,13 +461,23 @@ export class LifecycleCoordinator {
       ambiguous,
       rejected,
       roomsSeen: (audit.rooms ?? []).length,
+      skipped,
+      ...(workspaceIds === null ? {} : {requested: [...workspaceIds]}),
     };
     // 有歧义证据时仍记为「已审计」，否则每次启动都会重扫；歧义房间只留计数，不猜归属。
     const result = await this.#updateRequired((state) => {
       state.rooms = Array.isArray(state.rooms) ? state.rooms : [];
       const known = new Set(state.rooms.map((room) => room.workspaceId));
-      for (const draft of drafts) if (!known.has(draft.workspaceId)) state.rooms.push(draft);
-      state.migration = {version: 1, completed: true, at: new Date(this.#clock()).toISOString(), evidence};
+      const knownPaths = new Set(state.rooms.map((room) => room.canonicalCwd));
+      for (const draft of drafts) {
+        if (known.has(draft.workspaceId) || knownPaths.has(draft.canonicalCwd)) continue;
+        state.rooms.push(draft); known.add(draft.workspaceId); knownPaths.add(draft.canonicalCwd);
+      }
+      if (workspaceIds === null) {
+        state.migration = {version: 1, completed: true, at: new Date(this.#clock()).toISOString(), evidence};
+      } else {
+        state.migration = {...state.migration, evidence: {...(state.migration?.evidence ?? {}), lastRecovery: evidence}};
+      }
     });
     if (result.ok === false) {
       // 迁移没落盘就不能让启动流程继续走到 READY：旧房间还没有可靠的管理依据（复审 R2-F03）。

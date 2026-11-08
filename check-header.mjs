@@ -1519,3 +1519,35 @@ test('click and keyboard fold the entire cluster and state survives repaint', ()
   assert.equal(f.state.collapsed, true);
   f.dom.window.close();
 });
+
+function pickerFixture(managed, root = '/chats') {
+  let entry;
+  const context = vm.createContext({ window: { __ModuleLoader__: { load(value) { entry = value; } } }, Map, Set });
+  vm.runInContext(source.replace('      dictionaries,\n      inject,',
+    '      dictionaries,\n      picker: createHeroWorkspaceMenu,\n      receipt: isReceiptWorkspace,\n      setup(ids, root) { managedWorkspaceIds = new Set(ids); chatRoot = root; },\n      inject,'), context);
+  const jsx = (type, props) => ({ type, props });
+  const api = entry.factory(id => id === 'react' ? { useState: value => [value, () => {}] } : { jsx, jsxs: jsx });
+  api.setup(managed, root);
+  return { api, rows(items) {
+    const Menu = api.picker({ Button: 'Button', Menu: 'Menu', Modal: 'Modal' }, {});
+    return Menu({ open: true, useWorkspaces: select => select({ items }) }).props.children[0].props.items;
+  } };
+}
+
+test('picker hides managed workspaceId summaries and keeps legacy id compatibility', () => {
+  const f = pickerFixture(['native', 'legacy']);
+  const rows = f.rows([{ workspaceId: 'native', path: '/chats/.sessions/session-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa' },
+    { id: 'legacy', path: '/elsewhere' }, { workspaceId: 'ordinary', title: '独立对话', path: '/project' }]);
+  assert.deepEqual(Array.from(rows, row => row.id), ['ordinary', '::dsh-chat-sessions']);
+  assert.equal(f.api.receipt({ workspaceId: 'native' }), true);
+});
+
+test('picker hides historical receipts only within configured root without granting lifecycle ownership', () => {
+  const f = pickerFixture([]);
+  const leaf = '.sessions/session-aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
+  const historical = { workspaceId: 'old', path: `/chats/${leaf}` };
+  const rows = f.rows([historical, { workspaceId: 'foreign', path: `/another/${leaf}` },
+    { workspaceId: 'near', path: `/chats-copy/${leaf}` }, { workspaceId: 'normal', title: '独立对话', path: '/chats/project' }]);
+  assert.deepEqual(Array.from(rows, row => row.id), ['foreign', 'near', 'normal', '::dsh-chat-sessions']);
+  assert.equal(f.api.receipt(historical), false, 'display filtering must not expand lifecycle ownership');
+});

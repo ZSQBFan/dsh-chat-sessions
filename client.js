@@ -116,7 +116,7 @@ window.__ModuleLoader__.load({
         // Receipt workspaces (one per standalone session, path under `<root>/.sessions/`) are an
         // implementation detail of the composer unlock: never offer them as a place to work.
         const workspaces = (Array.isArray(snapshot?.items) ? snapshot.items : []).filter(
-          (workspace) => !isReceiptWorkspace(workspace),
+          (workspace) => !isPickerReceiptWorkspace(workspace),
         );
 
         const addEntry = {
@@ -730,23 +730,27 @@ window.__ModuleLoader__.load({
     /** Root that owns the session directories; filled from `/chat-sessions/config`. */
     let chatRoot = '';
 
-    /**
-     * Whether a workspace is a receipt for a standalone session directory.
-     *
-     * Path-only on purpose: the chat root arrives from an async config call, and until it does a
-     * root-based test lets every receipt through — which is how one showed up in the picker. The
-     * directory layout (`.sessions/session-<uuid>`) is unambiguous without knowing the root.
-     * @param workspace workspace summary from the shipped workspaces snapshot.
-     * @returns true for `<...>/.sessions/session-<uuid>` registrations.
-     */
+    /** Current ownership only; display compatibility never expands this set. */
     function isReceiptWorkspace(workspace) {
-      // 有明确托管集合时以它为准；只有拿不到清单时才退回路径形状（旧行为）。
+      const id = workspace?.workspaceId ?? workspace?.id;
       if (managedWorkspaceIds !== null) {
-        return typeof workspace?.id === 'string' && managedWorkspaceIds.has(workspace.id);
+        return typeof id === 'string' && managedWorkspaceIds.has(id);
       }
       const path = workspace?.path;
-      if (typeof path !== 'string') return false;
-      return /\.sessions\/session-[0-9a-fA-F-]{8,}$/u.test(path);
+      return typeof path === 'string' && /\.sessions\/session-[0-9a-fA-F-]{8,}$/u.test(path);
+    }
+
+    /** Historical receipt registrations belong out of the picker even before explicit migration.
+     * Only the configured root is used for path-based DISPLAY filtering; other workspaces and
+     * their lifecycle ownership remain untouched. Before config arrives, known managed IDs win.
+     */
+    function isPickerReceiptWorkspace(workspace) {
+      const id = workspace?.workspaceId ?? workspace?.id;
+      if (managedWorkspaceIds?.has(id)) return true;
+      if (chatRoot === '' || typeof workspace?.path !== 'string') return false;
+      const prefix = `${chatRoot.replace(/\/+$/u, '')}/.sessions/`;
+      return workspace.path.startsWith(prefix)
+        && /^session-[0-9a-fA-F-]{8,}$/u.test(workspace.path.slice(prefix.length));
     }
 
     /** Sidebar-only compatibility for native blank-before-archive visibility (B2-F001). */

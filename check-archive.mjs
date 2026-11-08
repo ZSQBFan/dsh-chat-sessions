@@ -49,6 +49,17 @@ test('boot keeps archived rooms on disk and retains native archived membership a
  }finally{await f.close();}
 });
 
+test('archived owner moves its link to archive even when an unarchived subagent shares cwd', async () => {
+ const f = await fixture(); try {
+  const a = await f.add(101); const child = await f.add(102, { cwd: a.directory });
+  f.snapshots.find(s => s.header.id === child.id).header.origin = 'subagent';
+  await f.request(); f.archived.add(a.id); await f.request();
+  assert.equal(await realpath(join(f.root, '.archive', 'Room-101')), a.directory);
+  assert.equal(await stat(join(f.root, 'Room-101')).then(() => true, () => false), false);
+  assert.equal(f.archived.has(child.id), false, 'link maintenance does not change child archive state');
+ } finally { await f.close(); }
+});
+
 test('shared-room archive preserves live sibling; all-archived content and links survive reboot',async()=>{
  const f=await fixture();try{const a=await f.add(5);const b=await f.add(6,{cwd:a.directory});await writeFile(join(a.directory,'keep'),'x');await f.request();
  f.archived.add(a.id);await f.request();assert.equal(await realpath(join(f.root,'Room-5')),a.directory);

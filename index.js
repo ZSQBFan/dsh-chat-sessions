@@ -31,7 +31,7 @@ import {
   tidyLinks,
 } from './links.js';
 import { isSessionDirName, sessionDirPath } from './gc.js';
-import { PROCESS_STATE, canonicalPath } from './lifecycle/model.js';
+import { PROCESS_STATE, canonicalPath, isSubagentHeader } from './lifecycle/model.js';
 import { LedgerStore, effectiveDshHome } from './lifecycle/store.js';
 import { LifecycleCoordinator } from './lifecycle/coordinator.js';
 
@@ -654,6 +654,7 @@ export function apply(ctx, config) {
    */
   function sharedWithVisibleSession(cwd, sessionId, durable, archived) {
     return durable.some((other) => other.header.id !== sessionId
+      && !isSubagentHeader(other.header)
       && other.header.cwd === cwd
       && !archived.has(other.header.id));
   }
@@ -804,6 +805,7 @@ export function apply(ctx, config) {
       const managedWorkspaces = await managedWorkspaceIdSet();
       for (const snapshot of durable) {
         const sessionId = snapshot.header.id;
+        if (isSubagentHeader(snapshot.header)) continue;
         if (!underSessionsRoot(snapshot.header.cwd, await knownSessionsRoots())) continue;
         if (only !== undefined && !only.has(sessionId)) continue;
         if (managedSessions !== null && !managedSessions.has(sessionId)) {
@@ -1166,6 +1168,16 @@ export function apply(ctx, config) {
             : createStandaloneSession();
           const created = await (coordinator === undefined ? work : coordinator.track(work));
           answer(res, 200, { ok: true, ...created });
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === `${ROUTE_PREFIX}/lifecycle/recover-legacy`) {
+          const body = await readJsonBody(req);
+          if (!(await lifecycleWritable()) || coordinator === undefined) {
+            answer(res, 409, {ok: false, code: 'LIFECYCLE_NOT_READY'});
+            return;
+          }
+          const result = await coordinator.track(Promise.resolve().then(() => coordinator.recoverLegacy(body)));
+          answer(res, result.ok ? 200 : result.blocked === 'WORKSPACE_IDS_REQUIRED' ? 400 : 409, result);
           return;
         }
         if (req.method === 'POST' && url.pathname === `${ROUTE_PREFIX}/link`) {

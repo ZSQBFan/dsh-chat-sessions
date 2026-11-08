@@ -400,3 +400,93 @@ test('R2-F11 restore terminal write failure stops later rooms', async () => {
     await host.close();
   }
 });
+
+// 真实宿主 stat().header 没有 JSONL 行上的 type 字段；旧版迁移必须兼容逻辑 header。
+test('legacy stat metadata without type is migrated and subagents remain excluded', async () => {
+  const {home, root, host} = await sandbox();
+  try {
+    const owner = 'session-12345678-1234-4234-8234-123456789abc';
+    const child = 'legacy-child';
+    const cwd = join(root, '.sessions', owner);
+    await mkdir(cwd, {recursive:true});
+    host.seedSession({id:owner,cwd}).version=4;
+    host.seedSession({id:child,cwd,origin:'subagent'}).version=4;
+    const workspace=await host.registry.create(cwd,'独立对话');
+    await workspace.attachSession(owner);await workspace.attachSession(child);
+    const original=host.ctx.sessionPersistence.stat;
+    host.ctx.sessionPersistence.stat=async id=>{const r=await original(id);if(!r)return r;const {type,...header}=r.header;return {...r,header};};
+    const opened=await open({host,home,root});
+    assert.equal((await opened.coordinator.start()).ok,true);
+    const after=await ledgerOf(opened.store);
+    assert.equal(after.rooms.length,1,'旧版房间必须进账本');
+    assert.deepEqual(after.rooms[0].sessionIds,[owner],'子代理不能被 attached 标记重新纳管');
+    const detached=await opened.coordinator.detach({reason:'PLUGIN_DISABLE'});
+    assert.equal(host.registry.get(workspace.id),undefined,JSON.stringify(detached));
+    await opened.coordinator.close();
+  }finally{await host.close();}
+});
+
+test('explicit legacy recovery repairs completed empty migration without adopting other rooms', async () => {
+  const {home,root,host}=await sandbox();
+  try {
+    const first=await open({host,home,root});await first.coordinator.start();
+    const owner='session-87654321-4321-4321-8321-cba987654321';
+    const cwd=join(root,'.sessions',owner);await mkdir(cwd,{recursive:true});host.seedSession({id:owner,cwd});
+    const workspace=await host.registry.create(cwd,'独立对话');await workspace.attachSession(owner);
+    const ordinary=await host.registry.create(root,'用户工作区');
+    const result=await first.coordinator.recoverLegacy({workspaceIds:[workspace.id,ordinary.id]});
+    assert.equal(result.ok,true,JSON.stringify(result));
+    assert.equal(result.legacy.adopted,1);
+    const after=await ledgerOf(first.store);
+    assert.deepEqual(after.rooms.map(r=>r.workspaceId),[workspace.id]);
+    assert.equal(after.migration.completed,true);
+    assert.equal(after.migration.evidence.lastRecovery.adopted,1);
+    const twice=await first.coordinator.recoverLegacy({workspaceIds:[workspace.id]});
+    assert.equal(twice.legacy.adopted,0);
+    assert.equal((await ledgerOf(first.store)).rooms.length,1);
+    await first.coordinator.detach({reason:'PLUGIN_DISABLE'});
+    assert.equal(host.registry.get(workspace.id),undefined);
+    assert.notEqual(host.registry.get(ordinary.id),undefined);
+    await first.coordinator.close();
+  }finally{await host.close();}
+});
+
+
+test('explicit legacy recovery preserves released rooms and rejects malformed requests', async () => {
+  const {home,root,host}=await sandbox();
+  try {
+    const first=await open({host,home,root});await first.coordinator.start();
+    const owner='session-a1234567-4321-4321-8321-cba987654321';
+    const cwd=join(root,'.sessions',owner);await mkdir(cwd,{recursive:true});host.seedSession({id:owner,cwd});
+    const workspace=await host.registry.create(cwd,'独立对话');await workspace.attachSession(owner);
+    assert.equal((await first.coordinator.recoverLegacy({workspaceIds:[]})).blocked,'WORKSPACE_IDS_REQUIRED');
+    assert.equal(first.coordinator.canWrite(),true);
+    await first.coordinator.recoverLegacy({workspaceIds:[workspace.id]});
+    await first.store.update(s=>{s.rooms[0].state=ROOM_STATE.RELEASED;for(const m of s.rooms[0].members)m.eligibility=ELIGIBILITY.USER_OWNED;});
+    const result=await first.coordinator.recoverLegacy({workspaceIds:[workspace.id]});
+    assert.equal(result.legacy.adopted,0);
+    assert.equal((await ledgerOf(first.store)).rooms[0].state,ROOM_STATE.RELEASED);
+    assert.equal(await first.coordinator.ownsSession(owner),false);
+    await first.coordinator.detach({reason:'PLUGIN_DISABLE'});
+    assert.notEqual(host.registry.get(workspace.id),undefined);
+    await first.coordinator.close();
+  }finally{await host.close();}
+});
+
+test('explicit recovery write failure degrades without touching native registrations', async () => {
+  const {home,root,host}=await sandbox();
+  try {
+    const first=await open({host,home,root});await first.coordinator.start();
+    const owner='session-b1234567-4321-4321-8321-cba987654321';
+    const cwd=join(root,'.sessions',owner);await mkdir(cwd,{recursive:true});host.seedSession({id:owner,cwd});
+    const workspace=await host.registry.create(cwd,'独立对话');await workspace.attachSession(owner);
+    const update=first.store.update.bind(first.store);
+    first.store.update=async()=>{const e=new Error('injected disk failure');e.code='ENOSPC';throw e;};
+    const result=await first.coordinator.recoverLegacy({workspaceIds:[workspace.id]});
+    assert.equal(result.ok,false);assert.equal(result.blocked,'ENOSPC');
+    assert.equal((await first.coordinator.describe()).state,'DEGRADED');
+    assert.deepEqual(host.registry.get(workspace.id).sessionIds,[owner]);
+    assert.equal((await ledgerOf(first.store)).rooms.length,0);
+    first.store.update=update;await first.coordinator.close();
+  }finally{await host.close();}
+});
