@@ -2,40 +2,38 @@
 
 ## [Unreleased]
 
-- 新增：生命周期交接。在 DSH 原生插件页显式停用插件或停用 bundle 时，插件撤掉自有工作区登记，会话回到原生「未分组」，仍可继续聊天并在原目录使用工具；重新安装/启用时只把仍未分组、目录身份匹配、归属明确的旧会话挂回原房间。普通重启、热更新、无关配置刷新保持原工作区不变。
-- 新增：生命周期账本 `<DSH_HOME>/storages/dsh-chat-sessions-lifecycle/<scopeId>/ledger.json`（scope = 数据根 + profile + 插件 + 规范化 root），单 writer 锁、原子落盘、坏账本只读降级（`DEGRADED`）。
-- 新增：`GET /chat-sessions/status` 返回 `lifecycle`、`managedWorkspaceIds`、`managedSessionIds`；前端改用明确托管集合判定归属，不再只按 `.sessions/session-*` 路径形状压平工作区。
-- 变更：**取消房间目录回收**。启动维护不再回收已归档空目录，任何目录（含空白与已归档）只在用户自己删除时消失；相应测试改为断言目录与文件保持。
-- 变更：启用、新建、空白复用、启动恢复共用一个生命周期闸门；账本未就绪时写请求返回 `409 LIFECYCLE_NOT_READY`。
-- 测试：新增 `npm run test:lifecycle`（19 项）、`test:lifecycle:native`（28 项真宿主断言）、`test:lifecycle:e2e`；`npm test` 纳入 `check-lifecycle*.mjs`（127 项）。
-- 文档：README 中英文、配置参考补充目录保留、停用与重装、恢复冲突、scope 与离线限制说明。
+以下内容已进入 `main`，尚未创建新版本、Release 或发行标签。包版本仍为 `0.1.1`，发布前须完成独立验收；宿主缺少条件删除/挂接 API 时，相关并发窗口仍为 `BLOCKED_HOST_CAPABILITY`。
 
-### 独立验收复审修复（2026-11-07）
+### Added
 
-- 修复：共享工作目录房间把同 `cwd` 的派生会话误判成外来成员，导致停用后房间 `CONFLICT`、无法交接。房间即目录，同目录成员一律按本房间处理。
-- 修复：恢复时会把用户在停用期间新建的**同路径普通工作区**当成自己的登记并挂会话。现在同路径已存在别的登记即判 `RELEASED`（`USER_CLAIMED`），只复用账本里记的那个 Workspace ID。
-- 修复：`PARTIAL` / `RELEASED` 房间的未挂回成员被错写成 `attached`，`managedSessionIds` 泄漏。托管集合现在只收托管态房间里真正挂上的成员。
-- 修复：创建意图或收尾写账本失败时仍返回 200。现在先落意图再建原生对象，写失败返回 `503 LIFECYCLE_LEDGER_UNAVAILABLE` 并降级，不再留下无账本的空壳。
-- 修复：活 writer 租约过期后双写、旧事务覆盖新提交。新增租约续租与提交前 `token` + `revision` 校验（`LOCK_LOST` / `REVISION_CONFLICT`），失败绝不覆盖。
-- 修复：账本被删后被静默当成首次安装重建。新增 `initialized.json` 凭据，判 `LEDGER_MISSING_AFTER_INIT` 并只读降级；老版本升级（有账本无凭据）以账本为准补写。
-- 修复：目录 `fsync` 的真实 I/O 错误被吞。平台不支持则记 `limitations`，真实故障抛 `LEDGER_DURABILITY_UNKNOWN`（消息写明 rename 已发生）。
-- 修复：维护扫描会绕过账本修改/改名非托管工作区。未托管会话与工作区现在只记 `retained-unmanaged`，不改标题、不删登记、不建目录。
-- 修复：旧数据审计被其它 scope 的账本阻断、祖先软链接路径误判。审计只读当前 scope 目录，路径比较统一走 canonical 身份。
-- 新增：首次升级的多证据迁移接入启动流程。无账本时按「registry + 真实目录 + 会话 header」认领可确认的旧房间，证据不足只计数不猜；写 `migration.completed` 避免每次启动重扫。
-- 新增：`test-support/native-lifecycle-harness.mjs` 覆盖同目录派生会话、`LC_NATIVE_REMOVE=1` 时的原生 bundle 卸载交接。
+- 生命周期账本：按数据根、profile、插件及规范化 root 隔离状态，记录创建意图、房间、成员资格和交接阶段，支持显式停用后的解绑及重新启用后的有条件恢复。
+- 原生插件/bundle 显式停用与卸载交接：仅撤销自有工作区登记，保留 Session ID、原 `cwd`、历史、任务目录、置顶及归档状态。普通重启和无关刷新以保留原 Workspace ID 为目标；离线直接删包没有可执行的交接过程。
+- `POST /chat-sessions/lifecycle/recover-legacy`：对指定 `workspaceIds` 补接管被旧版漏记的房间，要求 registry、真实目录身份、会话 header 和成员归属证据一致；不重置整个迁移状态，不接管已释放或冲突房间。
+- 状态接口提供 `lifecycle`、`managedWorkspaceIds`、`managedSessionIds`，使展示规则与实际维护资格分离。
 
-### 第二轮独立复审修复（2026-11-07/08）
+### Changed
 
-- 修复：提交在 `fence` 之后、`rename` 之前被挂起，租约过期后新 writer 提交，旧 writer 恢复仍覆盖（`generation` 10 → 1）。提交后追加 `history.jsonl` 再复验锁归属；锁已易主就按历史回写并抛 `LOCK_LOST`。
-- 修复：恢复意图写不进账本仍继续创建原生工作区。现在直接 `DEGRADED`，不产生原生副作用。
-- 修复：首次迁移写失败后启动流程又把 `DEGRADED` 覆盖成 `READY`。迁移失败向上抛 `blocked`，启动即失败。
-- 修复：收尾写账本失败留下的原生对象重启后不对账。启动按原生 registry 把已建成的意图补成房间（`ADOPTED`），停用后不再遗留工作区。
-- 修复：已排队的维护任务在停用完成后仍写标题软链接，`DEGRADED` 时也照写。`sweep` 按 `generation` 与 `canWrite()` 逐会话闸门，`/link` 与定时扫描都进 `coordinator.track`。
-- 修复：删除登记前的最后确认里看到的新同 `cwd` 成员没入账就删登记。现在先补进 `sessionIds`/`members`，写失败则不删登记。
-- 修复：同 `cwd` 的子代理成员被当派生成员补账并恢复。新增 `isSubagentHeader()`，派生与外来判定都跳过子代理。
-- 修复：`PARTIAL` 房间不再进入恢复候选，故障解除后也不重试。现在进入候选，只补缺失成员。
-- 修复：旧数据审计不识别 `initialized.json`，会把「账本丢失」报成 `adoptable`。审计现在输出 `initialized` / `INITIALIZED_WITHOUT_LEDGER`。
-- 测试：新增 `check-lifecycle-review2.mjs`（6 项，协调器级注入失败），`npm test` 133 项。
+- 取消房间目录自动回收，包括已归档空目录；空白会话由用户主动归档。标题软链接继续提供稳定工作目录的可读入口。
+- 创建、复用、迁移、维护与恢复经过生命周期闸门；先持久化意图，再创建原生对象。账本故障进入 `DEGRADED`，写入不就绪返回明确错误。
+- 账本使用保守的 owner lock：活进程的租约过期不会直接释放其锁。写入复核 token/revision；history 采用 prepared/committed 阶段、文件同步、身份校验及受锁保护的恢复，按 revision 再 generation 比较提交。
+- 恢复检查用户收编、目录缺失/替换、部分成员与共享目录；保留用户在停用期间的归属变更，不按路径或标题单独认领。
+
+### Fixed
+
+- 工作区切换菜单同时识别原生 `workspaceId` 和兼容 `id`，隐藏当前 root 的插件承载项，只保留一个「独立对话」入口；同名普通工作区及其它 root 不被误隐藏。展示过滤不扩大生命周期所有权。
+- 已归档 owner 的同目录子代理不再使旧标题软链接保持在活动区；维护扫描跳过子代理。
+- 真实宿主无 `type` 的逻辑 session header 在版本、ID、cwd 匹配时归一化，修复首次旧数据迁移漏记；已完成迁移的安装可显式补接管指定旧房间。
+- 恢复原生 Workspace ID 在 attach 前落账，终态写失败阻断 `READY` 并停止后续房间；停用可继续交接尚在 `RESTORING` 的房间。
+- PENDING 创建意图对账复核 header、cwd、用户归属与成员资格，并在提交前复读 registry；子代理不纳管。`PARTIAL` 只补符合资格的缺失成员。
+- history 启动恢复遇到锁忙、写失败或持久化不确定时阻断生命周期写入；无效 schema、外层/内层身份不一致和未提交 history 不用于恢复有效账本。
+- 已初始化账本丢失、目录 fsync 真实故障、scope 祖先软链接路径、维护任务晚写及批量恢复归档的任务追踪等边界处理。
+
+### Tests and verification
+
+- 默认离线验证的本机 macOS 基线：`npm run check` 81 项检查，`npm test` 146 项测试，均已通过；Linux CI 与其它环境须核对候选对应的实际运行结果，本机通过不替代跨平台验证。
+- 同一程序修复包已在隔离真实 DSH 0.2.2-rc.1 上完成原生生命周期 28 项断言及旧数据迁移/补接管 18 项断言。旧会话桌面交接已核对 Session→cwd、文件哈希、目录、软链及置顶/归档集合保持。
+- `test:lifecycle:e2e` 是服务级测试，不包含浏览器。`test:native` 是宿主客户端函数的 VM 契约测试，不等于真实 GUI 点击。
+- 完整真实 GUI、运行中交接、全部强杀恢复点、实际 HMR、跨版本、50 房间/100 会话及长循环仍需独立验证。详细交接见 `docs/testing/20261108/TEST-PLAN.md` 和 `AGENT-PROMPT.md`；历史报告不替代新候选的实测。
 
 ## 0.1.1 — 2026-11-06
 

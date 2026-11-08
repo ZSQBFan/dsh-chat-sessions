@@ -114,6 +114,9 @@
 - `npm run check`：包结构、导出、patch 与语法检查。
 - `npm test`：文件系统、DOM 与行为测试，只用开发依赖，不需要原生 DSH 包。
 - `npm run test:native`：原生侧栏投影契约，需本机已安装 DSH，并用 `DSH_NATIVE_WORKSPACE_CLIENT` 指向它的 `@deepseek-ai/dsh-client-ui-workspace/lib/client.js`。
+- `npm run test:lifecycle:native` / `npm run test:lifecycle:e2e`：隔离真实宿主的服务级生命周期测试；后者不含浏览器。
+
+完整独立验收见[测试手册](docs/testing/20261108/TEST-PLAN.md)，交给另一会话可使用[DeepSeek V4.1 Flash 执行 prompt](docs/testing/20261108/AGENT-PROMPT.md)。
 
 `check-*-browser.mjs` 是需要用浏览器手动打开的夹具，不包含在 `npm test` 内；其中成员位移夹具也需设置 `DSH_NATIVE_WORKSPACE_CLIENT`（或 `HARNESS_ROWS_SOURCE`）。CI 配置见 `.github/workflows/ci.yml`。
 

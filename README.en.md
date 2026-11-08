@@ -114,6 +114,9 @@ Node 22 or newer; CI uses Node 22. After `npm ci`:
 - `npm run check`: package structure, exports, patch, and syntax.
 - `npm test`: filesystem, DOM, and behaviour tests; development dependencies only, no native DSH packages.
 - `npm run test:native`: native sidebar projection contract; needs DSH installed locally, with `DSH_NATIVE_WORKSPACE_CLIENT` pointing at its `@deepseek-ai/dsh-client-ui-workspace/lib/client.js`.
+- `npm run test:lifecycle:native` / `npm run test:lifecycle:e2e`: service-level lifecycle checks in an isolated real host; the latter does not run a browser.
+
+See the [independent acceptance plan](docs/testing/20261108/TEST-PLAN.md) and [DeepSeek V4.1 Flash handoff prompt](docs/testing/20261108/AGENT-PROMPT.md) (both in Chinese).
 
 `check-*-browser.mjs` are fixtures you open in a browser by hand and are not part of `npm test`; the membership fixture also needs `DSH_NATIVE_WORKSPACE_CLIENT` (or `HARNESS_ROWS_SOURCE`). CI is defined in `.github/workflows/ci.yml`.
 
