@@ -373,6 +373,15 @@ export class LifecycleCoordinator {
         this.degrade(REASON.LEDGER_INVALID, 'legacy recovery requires a valid existing ledger');
         return {ok: false, blocked: REASON.LEDGER_INVALID};
       }
+      const registry = await readRegistry(this.#ctx);
+      if (registry.ok === false) {
+        this.degrade(REASON.LEDGER_WRITE_FAILED, 'legacy recovery workspace registry is unavailable');
+        return {ok: false, blocked: REASON.LEDGER_WRITE_FAILED};
+      }
+      const knownIds = new Set(registry.workspaces.map((workspace) => workspace.id));
+      if (workspaceIds.some((id) => !knownIds.has(id))) {
+        return {ok: false, blocked: 'WORKSPACE_IDS_INVALID'};
+      }
       const result = await this.#migrateLegacy(ledger, {workspaceIds: new Set(workspaceIds)});
       return {ok: result.blocked === undefined, ...result};
     } finally {
@@ -982,7 +991,7 @@ export class LifecycleCoordinator {
         // 意图没落盘就等于这次恢复没有持久阶段依据：整个启动不许走到 READY（复审 R2-F02）。
         summary.blocked = intent.code ?? REASON.LEDGER_WRITE_FAILED;
         summary.conflicts.push(room.ownerSessionId);
-        continue;
+        return summary;
       }
 
       // 同路径登记分三种：自己的（id 与账本一致）、别人的（用户新登记）、没有。
@@ -1051,10 +1060,11 @@ export class LifecycleCoordinator {
         state.rooms[index].workspaceId = workspaceId;
       });
       if (workspaceRecorded.ok === false) {
-        this.degrade(workspaceRecorded.code ?? REASON.LEDGER_WRITE_FAILED, 'restore workspace identity could not be persisted');
+        this.degrade(workspaceRecorded.code ?? REASON.LEDGER_WRITE_FAILED,
+          `restore workspace id ${workspaceId} could not be persisted for ${room.ownerSessionId}; inspect before manual cleanup`);
         summary.blocked = workspaceRecorded.code ?? REASON.LEDGER_WRITE_FAILED;
         summary.conflicts.push(room.ownerSessionId);
-        continue;
+        return summary;
       }
 
       // 逐个 attach 前重新读原生快照：宿主没有原子的「条件挂接」，只能把检查贴到每一次挂接前。

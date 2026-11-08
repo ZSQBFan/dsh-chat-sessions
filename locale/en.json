@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "Chat Sessions",
-    "description": "Standalone chats without choosing a project workspace first. The plugin maintains native workspaces in the background: a new room gets a working directory, and derived sessions may share it."
+    "description": "Create a chat with its own workspace in one click, so everyday questions and small tasks can start without manually choosing a project directory."
   }
 }

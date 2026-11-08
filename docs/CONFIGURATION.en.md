@@ -2,7 +2,7 @@
 
 [Back to README](../README.en.md) · [简体中文](CONFIGURATION.md)
 
-This reference covers every plugin setting read by v0.1.1: six common settings, two experimental options, and the retired `idleMs` key. Omitted settings use their defaults.
+This reference covers every plugin setting read by v0.2.0: six common settings, two experimental options, and the retired `idleMs` key. Omitted settings use their defaults.
 
 ## Applying settings
 
@@ -50,7 +50,10 @@ Handoff on disable, uninstall, and re-enable is automatic and has no configurati
 - **Ledger**: `<DSH_HOME>/storages/dsh-chat-sessions-lifecycle/<scopeId>/ledger.json` (with `lock.json` beside it). It sits outside both the installed package and the room directories, and stores session ids, paths, phases, and error codes only — never conversation content.
 - **scope identity**: derived from the DSH data root, the active profile name, the plugin id, and the canonical `root`. A different profile, `DSH_HOME`, or `root` yields a different scope; nothing is migrated implicitly, and the old scope's ledger is left untouched.
 - **Single writer**: one plugin instance per scope. Without the lock the plugin degrades to read-only and reports `LOCK_HELD` instead of touching native registrations concurrently.
-- **Degraded state**: a corrupt ledger, a newer schema version, or a lock conflict stops automatic changes; `GET /chat-sessions/status` reports `lifecycle.state = DEGRADED` with empty `managedWorkspaceIds` / `managedSessionIds`.
+- **Degraded state**: a corrupt ledger, newer schema, lock conflict, or failed required recovery write closes lifecycle write operations and reports `DEGRADED`. Managed sets are empty when the ledger is invalid; for other degraded causes, confirmed ledger members may still be listed, but automatic writes remain disabled.
+- **Interrupted creation**: a forced process exit between native Workspace/Session creation and ledger finalization can leave an unmanaged native workspace. Check status diagnostics; if an ID is provided, inspect that workspace's path and members in DSH. If there is no ID, inspect empty workspaces under this plugin's `.sessions` directory. Remove only a registration confirmed empty; if it has members or the path is unclear, keep it and manually reassign sessions. Do not delete `session-*` directories or logs, and do not edit `workspace.json` or the lifecycle ledger. This edge is handled manually rather than by speculative cleanup.
+- **Legacy recovery API**: explicit recovery validates requested workspace IDs first. An unknown ID returns HTTP 400 without changing the ledger.
+- **History**: malformed or incomplete history entries are not recovery sources; the current implementation does not emit a diagnostic for every bad entry. If recovery is blocked or the ledger looks unexpected, stop lifecycle operations and preserve the ledger, history, and lock files for inspection. Do not move/rename a lock while its owner is running, or overwrite/delete the ledger or history.
 - **Directories**: no room directory is reclaimed from this version on, archived empty ones included. Delete them yourself in the filesystem if you want them gone.
 
 `/chat-sessions/status` also returns `managedWorkspaceIds` and `managedSessionIds`, so the client stops inferring ownership from path shape.
@@ -61,6 +64,6 @@ Handoff on disable, uninstall, and re-enable is automatic and has no configurati
 | --- | --- | --- |
 | `idleMs` | Ignored since v0.1.1 | Former threshold for automatic archiving based on log inactivity. Leaving it in an old configuration has no effect and does not enable startup archiving. |
 
-In v0.1.1, archive blank sessions manually. Unarchived chats remain available when the plugin starts or is re-enabled. Startup maintenance only reclaims owned empty directories that are **already archived** and have no unarchived session sharing them (`.DS_Store` alone is allowed), preserving session logs and archive flags. Directory reclamation and session archiving are separate operations.
+In v0.1.1, archive blank chats manually; unarchived chats remained available when the plugin started or was re-enabled. Startup maintenance reclaimed owned empty directories that were **already archived** and had no unarchived session sharing them (`.DS_Store` alone was allowed), while preserving session logs and archive flags. Since v0.2.0, the plugin no longer reclaims any room directory, including archived empty ones, and disabling or uninstalling the plugin does not archive chats.
 
 There are currently no other plugin settings for idle archiving, automatic archiving at startup, polling intervals, or toggling empty-directory reclamation. `DSH_HOME` is a host environment variable affecting the default `root`, not a plugin-row configuration field.

@@ -401,6 +401,50 @@ test('R2-F11 restore terminal write failure stops later rooms', async () => {
   }
 });
 
+test('restore write failure stops later rooms and reports the created workspace id', async () => {
+  const {home, root, host} = await sandbox();
+  try {
+    const owners = [
+      `session-${'f'.repeat(8)}-ffff-4fff-8fff-ffffffffffff`,
+      `session-${'a'.repeat(8)}-aaaa-4aaa-8aaa-aaaaaaaaaaaa`,
+    ];
+    const rooms = [];
+    for (const owner of owners) {
+      const cwd = join(root, '.sessions', owner);
+      await mkdir(cwd, {recursive: true});
+      host.seedSession({cwd, id: owner});
+      rooms.push({
+        workspaceId: `ws-old-${owner.slice(8, 16)}`,
+        ownerSessionId: owner,
+        cwd,
+        canonicalCwd: cwd,
+        state: ROOM_STATE.DETACHED,
+        sessionIds: [owner],
+        members: [{sessionId: owner, eligibility: ELIGIBILITY.ELIGIBLE}],
+        operation: null,
+        lastError: null,
+      });
+    }
+    const seeded = await LedgerStore.open({dshHome: home, canonicalRoot: root, profileId: 'review-2'});
+    await seeded.update((state) => {
+      state.migration = {version: 1, completed: true, at: new Date().toISOString(), evidence: {}};
+      state.rooms = rooms;
+    });
+    await seeded.close();
+
+    const reopened = await open({host, home, root, failAt: 2});
+    const started = await reopened.coordinator.start();
+    assert.equal(started.ok, false);
+    assert.equal(reopened.coordinator.state, PROCESS_STATE.DEGRADED);
+    assert.equal(host.workspaces.length, 1, 'after a ledger write failure, do not create another room');
+    const message = reopened.coordinator.diagnostics.map((item) => item.message).join('\n');
+    assert.match(message, /restore workspace id ws-/u, 'report the id of the possibly empty registration for manual cleanup');
+    await reopened.coordinator.close();
+  } finally {
+    await host.close();
+  }
+});
+
 // 真实宿主 stat().header 没有 JSONL 行上的 type 字段；旧版迁移必须兼容逻辑 header。
 test('legacy stat metadata without type is migrated and subagents remain excluded', async () => {
   const {home, root, host} = await sandbox();
@@ -426,6 +470,22 @@ test('legacy stat metadata without type is migrated and subagents remain exclude
   }finally{await host.close();}
 });
 
+test('D07 unknown workspace ids are rejected without changing the ledger', async () => {
+  const {home, root, host} = await sandbox();
+  try {
+    const opened = await open({host, home, root});
+    await opened.coordinator.start();
+    const before = await readFile(opened.store.path);
+    const result = await opened.coordinator.recoverLegacy({workspaceIds: ['ws-does-not-exist']});
+    assert.equal(result.ok, false);
+    assert.equal(result.blocked, 'WORKSPACE_IDS_INVALID');
+    assert.deepEqual(await readFile(opened.store.path), before, 'invalid ids must not write migration evidence');
+    assert.equal(host.workspaces.length, 0);
+    await opened.coordinator.close();
+  } finally {
+    await host.close();
+  }
+});
 test('explicit legacy recovery repairs completed empty migration without adopting other rooms', async () => {
   const {home,root,host}=await sandbox();
   try {

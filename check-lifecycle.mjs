@@ -26,6 +26,23 @@ async function sandbox() {
   return { base, home, root, host };
 }
 
+test('unknown legacy Workspace ID returns HTTP 400 without changing ledger state', async () => {
+  const {home, host} = await sandbox();
+  try {
+    assert.equal((await host.request('/status', {}, 'GET')).status, 200);
+    const [scope] = await readLedgerText(home);
+    const path = join(home, 'storages', 'dsh-chat-sessions-lifecycle', scope.scope, 'ledger.json');
+    const before = await readFile(path);
+    const response = await host.request('/lifecycle/recover-legacy', {workspaceIds: ['ws-does-not-exist']});
+    assert.equal(response.status, 400);
+    assert.equal(response.body.blocked, 'WORKSPACE_IDS_INVALID');
+    assert.deepEqual(await readFile(path), before);
+    assert.equal(host.workspaces.length, 0);
+  } finally {
+    await host.close();
+  }
+});
+
 /** 创建一条独立对话，返回会话与房间信息。 */
 async function createRoom(host) {
   const created = await host.request('/create', {});

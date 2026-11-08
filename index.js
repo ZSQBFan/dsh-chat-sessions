@@ -1177,7 +1177,7 @@ export function apply(ctx, config) {
             return;
           }
           const result = await coordinator.track(Promise.resolve().then(() => coordinator.recoverLegacy(body)));
-          answer(res, result.ok ? 200 : result.blocked === 'WORKSPACE_IDS_REQUIRED' ? 400 : 409, result);
+          answer(res, result.ok ? 200 : ['WORKSPACE_IDS_REQUIRED', 'WORKSPACE_IDS_INVALID'].includes(result.blocked) ? 400 : 409, result);
           return;
         }
         if (req.method === 'POST' && url.pathname === `${ROUTE_PREFIX}/link`) {

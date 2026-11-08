@@ -1,6 +1,6 @@
 {
   "name": "dsh-chat-sessions",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "check": "node check.mjs",
@@ -11,7 +11,7 @@
     "test:lifecycle:e2e": "node --test check-lifecycle-e2e.mjs",
     "verify": "npm run check && npm test"
   },
-  "description": "Standalone chats without choosing a project workspace first: the plugin maintains native workspaces in the background, a new room gets a working directory, and derived sessions may share it.",
+  "description": "Create a chat with its own workspace in one click, so everyday questions and small tasks can start without manually choosing a project directory.",
   "keywords": [
     "dsh",
     "dsh-plugin",
