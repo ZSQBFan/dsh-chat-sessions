@@ -43,6 +43,9 @@ async function fixture(options = {}) {
   const calls = [];
   const live = new Map();
   let createRelease;
+  // 确定性信号：第一个 create 真正进入时立即兑现，避免测试靠「轮询 N 个事件循环回合」猜时机。
+  let resolveCreateStarted;
+  const createStarted = new Promise((resolve) => { resolveCreateStarted = resolve; });
   const registry = {
     archivedSessionIds: ['archived'],
     list: () => workspaces,
@@ -57,6 +60,7 @@ async function fixture(options = {}) {
     async list() { return { items: summaries }; },
     async create(request) {
       calls.push(request);
+      resolveCreateStarted();
       if (request.sessionId === 'blank' && options.delayReuse === true) {
         await new Promise((resolve) => { createRelease = resolve; });
       }
@@ -120,6 +124,7 @@ async function fixture(options = {}) {
     summaries,
     workspaces,
     releaseReuse() { createRelease?.(); },
+    createStarted,
     request,
     close: async () => { for (const cleanup of cleanups.reverse()) cleanup?.(); await rm(root, { recursive: true, force: true }); },
   };
@@ -166,10 +171,15 @@ test('concurrent opt-in requests share one reuse flight', async () => {
   try {
     const first = f.request({ reuseBlank: true });
     const second = f.request({ reuseBlank: true });
-    for (let turn = 0; turn < 10 && f.calls.length === 0; turn++) {
-      await new Promise((resolve) => setImmediate(resolve));
-    }
-    assert.equal(f.calls.length, 1);
+    // 等真实的 create 进入，而不是固定 N 个事件循环回合（后者在慢机器上会在文件系统
+    // realpath 返回前就耗尽预算，导致 0 !== 1 的假失败）。
+    await Promise.race([
+      f.createStarted,
+      new Promise((_, reject) => {
+        setTimeout(() => reject(new Error('首个 create 调用未在 5s 内进入')), 5_000).unref();
+      }),
+    ]);
+    assert.equal(f.calls.length, 1, '首个 create 进入时，第二个并发请求不得再发起 create');
     f.releaseReuse();
     const [left, right] = await Promise.all([first, second]);
     assert.equal(left.body.sessionId, 'blank');

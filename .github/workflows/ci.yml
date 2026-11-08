@@ -1,12 +1,22 @@
 name: CI
 
 on:
+  # 只跑分支推送：tag 指向的提交已经在分支上验过，checks 挂在提交上，
+  # 再为 tag 单独跑一次只会得到一条重复且容易误导的红色/绿色记录。
   push:
+    branches:
+      - '**'
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -14,5 +24,18 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npm run check
-      - run: npm test
+      # tee 到文件：失败时这些日志随 artifact 上传，排障不用再去翻页面。
+      - name: Check
+        run: set -o pipefail && npm run check 2>&1 | tee check.log
+      - name: Test
+        run: set -o pipefail && npm test 2>&1 | tee test.log
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            check.log
+            test.log
+          if-no-files-found: ignore
+          retention-days: 14

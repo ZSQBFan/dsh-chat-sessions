@@ -587,13 +587,22 @@ async function withDirectorySyncFault(workspace, code, run) {
 
 test('9. F05 活 writer 租约过期后不得覆盖接管者的提交（心跳 + token/revision fencing）', async (t) => {
   const workspace = await makeWorkspace(t);
-  const leaseMs = 120;
+  // 三个时间必须同时成立，才能既有语义又有抗抖动余量：
+  //   leaseMs > CI 上一次事件循环停顿的量级（共享 4 核 VM 上实测可达数百 ms），否则提交前的
+  //            fencing 会把「调度抖动」误判成「租约过期」，测试随机红；
+  //   bAttemptMs > leaseMs  → B 抢锁时 A 的租约确实已过期；
+  //   bAttemptMs < blockMs  → B 抢锁时 A 仍存活在 mutator 里（反证活 writer 不被抢锁）。
+  // 于是把 A 的阻塞时长放大到 3s、租约 800ms、B 在 1.5s 抢锁：抖动余量 700ms 起步。
+  // 可用 DCS_LEASE_MS 覆盖租约，上限由 bAttemptMs 决定。
+  const blockMs = 3_000;
+  const bAttemptMs = 1_500;
+  const leaseMs = Math.min(Number(process.env.DCS_LEASE_MS ?? 800), bAttemptMs - 200);
   const store = await openStore(workspace, { leaseMs });
   assert.equal((await store.update((state) => {
     state.generation = 0;
   })).revision, 1);
 
-  // A：真子进程，mutator 里同步挂起 900ms，心跳停摆 → 租约必然过期。
+  // A：真子进程，mutator 里同步挂起 blockMs，心跳停摆 → 租约必然过期。
   const child = fork(fileURLToPath(import.meta.url), [
     LEASE_WORKER_FLAG,
     JSON.stringify({
@@ -602,7 +611,7 @@ test('9. F05 活 writer 租约过期后不得覆盖接管者的提交（心跳 +
       pluginId: 'chat-sessions',
       profileId: 'profile-a',
       leaseMs,
-      blockMs: 900,
+      blockMs,
     }),
   ], { stdio: ['ignore', 'ignore', 'inherit', 'ipc'] });
   t.after(() => {
@@ -615,7 +624,7 @@ test('9. F05 活 writer 租约过期后不得覆盖接管者的提交（心跳 +
   const reportPromise = once(child, 'message');
 
   // B：旧 writer 仍存活（即便租约已过期）时也不得抢锁；这与 dsh-chat 的保守 owner-lock 语义一致。
-  await delay(leaseMs * 3);
+  await delay(bAttemptMs);
   const b = await openStore(workspace, { leaseMs });
   await assert.rejects(
     b.update((state) => {
